@@ -54,14 +54,16 @@ dialec inbox coordinator   # read responses from children
 
 ## Quick Start: Autonomous Overnight Mode
 
-Claude drives end-to-end without you. Set a goal, set a budget, walk away.
+Claude drives end-to-end without you. Set a goal, set a time, walk away.
 
-### Option A: Headless coordinator (Claude drives everything)
+### "Work on this project until 8am"
 
 ```bash
 cd /path/to/your/project
-dialec start --mode autonomous --goal "implement the auth module per docs/auth-spec.md" --budget '$10'
-dialec tail --coordinator --follow   # watch it work (optional)
+dialec start --mode autonomous \
+  --goal "implement the auth module per docs/auth-spec.md" \
+  --until "8am ET" \
+  --budget '$15'
 ```
 
 This spawns a headless Claude with the coordinator skill. It:
@@ -72,7 +74,14 @@ This spawns a headless Claude with the coordinator skill. It:
 - Verifies, meta-verifies, deslops each pod
 - Merges converged pods
 - Runs cleanup/refactor with adversarial review
-- Writes `.dialec/session/final-report.md` when done
+- **Checks if the goal was actually achieved** (not just "phases done")
+- **When phases complete and time remains, asks a PM agent "what's next?"
+  and loops back** — hackathon mode, keeps building until the deadline
+
+Watch it work (optional):
+```bash
+dialec tail --coordinator --follow
+```
 
 Review in the morning:
 ```bash
@@ -80,6 +89,41 @@ dialec status
 dialec log
 cat .dialec/session/final-report.md
 ```
+
+### Time and budget formats
+
+```bash
+--budget '$10'              # cost cap
+--budget '4h'               # time cap (4 hours from now)
+--until '8am ET'            # work until 8am Eastern
+--until '6:30am'            # local timezone
+--until '22:00 UTC'         # 24-hour UTC
+--budget '$15, until 8am ET'  # combine cost + time
+
+# Supported timezones: ET/EDT/EST, CT/CST, MT/MST, PT/PDT/PST, UTC/GMT
+```
+
+When `--until` is set, dialec enters **hackathon mode**: after completing
+all phases, it asks "what should we build next?" and loops back to the
+spec phase with a new goal. It keeps going until the deadline or the PM
+agent says there's nothing left to do.
+
+### Stopping conditions
+
+The session stops when ANY of these are true:
+- All phases converge AND no `work_until` time remains
+- Cost budget exceeded (`--budget '$10'`)
+- Time deadline reached (`--until '8am ET'`)
+- Deadlock (autonomous mode fails closed on correctness/security blockers)
+- PM agent says "NO_MORE_WORK" in hackathon loop
+- Coordinator Claude hits its own token limit
+
+### Goal achievement detection
+
+After the implementation phase converges, dialec asks a verifier:
+"has this goal actually been achieved?" If not, and there's time
+remaining, it loops back to the spec phase to address what's missing.
+This prevents the "all phases converged on the wrong thing" failure mode.
 
 ### Option B: Deterministic drive (no coordinator, dialec does it)
 

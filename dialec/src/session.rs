@@ -180,6 +180,14 @@ pub fn enforce_budget(root: &Path, phase: Option<&str>) -> Result<()> {
             state.budget.max_usd
         );
     }
+    if let Some(deadline) = state.budget.deadline {
+        if Utc::now() >= deadline {
+            anyhow::bail!(
+                "deadline reached: {}",
+                deadline.format("%Y-%m-%d %H:%M %Z")
+            );
+        }
+    }
     if let (Some(phase), Some(max_phase_usd)) = (phase, state.budget.per_phase_max_usd) {
         let phase_cost = phase_cost(root, phase)?;
         if phase_cost >= max_phase_usd {
@@ -191,6 +199,15 @@ pub fn enforce_budget(root: &Path, phase: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Returns true if there's still time remaining before the work_until deadline.
+pub fn has_time_remaining(root: &Path) -> Result<bool> {
+    let state = read_state(root)?;
+    match state.budget.work_until {
+        Some(until) => Ok(Utc::now() < until),
+        None => Ok(false),
+    }
 }
 
 fn phase_cost(root: &Path, phase: &str) -> Result<f64> {
@@ -387,29 +404,133 @@ fn ensure_empty_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn budget_config(budget: Option<String>) -> BudgetConfig {
+pub fn budget_config(budget: Option<String>) -> BudgetConfig {
     let mut cfg = default_config().budget;
-    if let Some(raw) = budget {
-        let raw = raw.trim();
-        if let Some(stripped) = raw.strip_prefix('$') {
-            if let Ok(value) = stripped.parse::<f64>() {
-                cfg.max_usd = value;
-            }
-        } else if let Some(stripped) = raw.strip_suffix('h') {
-            if let Ok(value) = stripped.parse::<f64>() {
-                cfg.max_hours = Some(value);
-            }
-        } else if let Some(stripped) = raw.strip_suffix("turns") {
-            if let Ok(value) = stripped.parse::<u32>() {
-                cfg.max_turns = Some(value);
-            }
-        } else if let Some(stripped) = raw.strip_suffix("turn")
-            && let Ok(value) = stripped.parse::<u32>()
-        {
-            cfg.max_turns = Some(value);
-        }
+    let Some(raw) = budget else { return cfg };
+    let raw = raw.trim();
+
+    // Support multiple constraints separated by commas: "$10, until 8am ET"
+    for part in raw.split(',') {
+        parse_budget_part(part.trim(), &mut cfg);
+    }
+    // If only "until" is set without a separate deadline, use work_until as deadline too
+    if cfg.deadline.is_none() {
+        cfg.deadline = cfg.work_until;
     }
     cfg
+}
+
+fn parse_budget_part(part: &str, cfg: &mut BudgetConfig) {
+    // "$10" or "$10.50"
+    if let Some(stripped) = part.strip_prefix('$') {
+        if let Ok(value) = stripped.parse::<f64>() {
+            cfg.max_usd = value;
+        }
+        return;
+    }
+
+    // "4h" or "0.5h"
+    if let Some(stripped) = part.strip_suffix('h') {
+        if let Ok(hours) = stripped.trim().parse::<f64>() {
+            cfg.max_hours = Some(hours);
+            let deadline = Utc::now() + chrono::Duration::seconds((hours * 3600.0) as i64);
+            cfg.deadline = Some(deadline);
+        }
+        return;
+    }
+
+    // "10turns" or "10 turns"
+    if let Some(stripped) = part.strip_suffix("turns").or_else(|| part.strip_suffix("turn")) {
+        if let Ok(value) = stripped.trim().parse::<u32>() {
+            cfg.max_turns = Some(value);
+        }
+        return;
+    }
+
+    // "until 8am ET", "until 8am", "until 6:30am ET", "until 22:00"
+    if let Some(time_str) = part.strip_prefix("until ").or_else(|| part.strip_prefix("until:")) {
+        if let Some(deadline) = parse_until_time(time_str.trim()) {
+            cfg.work_until = Some(deadline);
+            cfg.deadline = Some(deadline);
+        }
+        return;
+    }
+}
+
+fn parse_until_time(s: &str) -> Option<chrono::DateTime<Utc>> {
+    use chrono::{Local, NaiveTime, TimeZone, FixedOffset};
+
+    // Strip timezone suffix if present
+    let (time_part, tz_offset_hours) = if s.ends_with(" ET") || s.ends_with(" EST") {
+        (s.trim_end_matches(" ET").trim_end_matches(" EST"), -5)
+    } else if s.ends_with(" EDT") {
+        (s.trim_end_matches(" EDT"), -4)
+    } else if s.ends_with(" CT") || s.ends_with(" CST") {
+        (s.trim_end_matches(" CT").trim_end_matches(" CST"), -6)
+    } else if s.ends_with(" PT") || s.ends_with(" PST") {
+        (s.trim_end_matches(" PT").trim_end_matches(" PST"), -8)
+    } else if s.ends_with(" PDT") {
+        (s.trim_end_matches(" PDT"), -7)
+    } else if s.ends_with(" MT") || s.ends_with(" MST") {
+        (s.trim_end_matches(" MT").trim_end_matches(" MST"), -7)
+    } else if s.ends_with(" UTC") || s.ends_with(" GMT") {
+        (s.trim_end_matches(" UTC").trim_end_matches(" GMT"), 0)
+    } else {
+        // Assume local timezone
+        let local_offset = Local::now().offset().local_minus_utc() / 3600;
+        (s, local_offset)
+    };
+
+    let time_part = time_part.trim();
+
+    // Parse various time formats
+    let naive_time = parse_naive_time(time_part)?;
+
+    let tz = FixedOffset::east_opt(tz_offset_hours * 3600)?;
+    let today = Utc::now().with_timezone(&tz).date_naive();
+    let naive_dt = today.and_time(naive_time);
+    let target = tz.from_local_datetime(&naive_dt).single()?;
+    let target_utc = target.with_timezone(&Utc);
+
+    // If the target is in the past, assume tomorrow
+    if target_utc <= Utc::now() {
+        Some(target_utc + chrono::Duration::hours(24))
+    } else {
+        Some(target_utc)
+    }
+}
+
+fn parse_naive_time(s: &str) -> Option<chrono::NaiveTime> {
+    use chrono::NaiveTime;
+
+    // "8am", "8pm", "8:30am", "11pm", "8:30 am"
+    let s = s.replace(' ', "").to_lowercase();
+
+    if let Some(before_am) = s.strip_suffix("am") {
+        let parts: Vec<&str> = before_am.split(':').collect();
+        let hour = parts[0].parse::<u32>().ok()?;
+        let hour = if hour == 12 { 0 } else { hour };
+        let min = parts.get(1).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+        return NaiveTime::from_hms_opt(hour, min, 0);
+    }
+
+    if let Some(before_pm) = s.strip_suffix("pm") {
+        let parts: Vec<&str> = before_pm.split(':').collect();
+        let hour = parts[0].parse::<u32>().ok()?;
+        let hour = if hour == 12 { hour } else { hour + 12 };
+        let min = parts.get(1).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+        return NaiveTime::from_hms_opt(hour, min, 0);
+    }
+
+    // "22:00", "8:30"
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() == 2 {
+        let hour = parts[0].parse::<u32>().ok()?;
+        let min = parts[1].parse::<u32>().ok()?;
+        return NaiveTime::from_hms_opt(hour, min, 0);
+    }
+
+    None
 }
 
 fn role_prompt(role: &str, config: &Config) -> String {

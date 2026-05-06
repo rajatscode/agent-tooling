@@ -93,10 +93,52 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
                 drive_cleanup(root, &config, &mut state, max_rounds, pane)?;
                 break;
             }
-            "done" => break,
+            "done" => {
+                // Hackathon mode: if work_until hasn't passed, find more work
+                if crate::session::has_time_remaining(root)? {
+                    log_timeline(
+                        root,
+                        json!({
+                            "event": "hackathon-loop",
+                            "reason": "work_until deadline not reached, finding more work",
+                            "at": Utc::now()
+                        }),
+                    )?;
+                    // Ask a PM/planner what to work on next
+                    let next_goal = plan_next_work(root, &config, pane)?;
+                    if let Some(goal) = next_goal {
+                        state.goal = Some(goal);
+                        state.current_phase = "spec".to_string();
+                        mark_phase(&mut state, "spec", "in-progress");
+                        mark_phase(&mut state, "implement", "pending");
+                        mark_phase(&mut state, "cleanup", "pending");
+                        write_state(root, &state)?;
+                        continue; // loop back to spec phase
+                    }
+                }
+                break;
+            }
             other => return Err(anyhow!("unknown phase: {other}")),
         }
         if state.current_phase == "done" {
+            // Check goal achievement before declaring done
+            if let Some(goal) = &state.goal {
+                let achieved = check_goal_achieved(root, &config, goal, pane)?;
+                if !achieved && crate::session::has_time_remaining(root)? {
+                    log_timeline(
+                        root,
+                        json!({
+                            "event": "goal-not-achieved",
+                            "reason": "goal check failed, retrying with time remaining",
+                            "at": Utc::now()
+                        }),
+                    )?;
+                    state.current_phase = "spec".to_string();
+                    mark_phase(&mut state, "spec", "in-progress");
+                    write_state(root, &state)?;
+                    continue;
+                }
+            }
             break;
         }
     }
@@ -1229,6 +1271,88 @@ fn update_memory(root: &Path, phase: &str, artifacts: &[PathBuf]) -> Result<()> 
         .with_context(|| format!("failed to update {}", decisions.display()))?;
     file.write_all(entry.as_bytes())?;
     Ok(())
+}
+
+/// Ask a PM/planner agent what to work on next (hackathon mode).
+fn plan_next_work(root: &Path, config: &Config, pane: bool) -> Result<Option<String>> {
+    let pm_role = if config.roles.contains_key("pm") {
+        "pm"
+    } else {
+        "spec-writer" // fall back to spec-writer as planner
+    };
+    let memory_dir = dialec_dir(root).join("memory");
+    let decisions = memory_dir.join("decisions.md");
+    let tx = run_role(
+        root,
+        config,
+        RoleRun {
+            phase: "spec",
+            role: pm_role,
+            pod: None,
+            workspace: root,
+            task: "The previous goal has been completed. Review `.dialec/memory/decisions.md` and the current codebase. What is the highest-impact thing to build or improve next? Respond with a single clear goal statement in your convergence signal summary. If there is nothing meaningful left to do, approve with summary 'NO_MORE_WORK'.".to_string(),
+            artifacts: existing(vec![decisions]),
+            sandbox: "read-only",
+            approval: "never",
+            pane,
+        },
+    )?;
+    if tx.signal.verdict == "approve" && tx.signal.summary.contains("NO_MORE_WORK") {
+        log_timeline(
+            root,
+            json!({"event": "hackathon-no-more-work", "at": Utc::now()}),
+        )?;
+        return Ok(None);
+    }
+    log_timeline(
+        root,
+        json!({
+            "event": "hackathon-next-goal",
+            "goal": tx.signal.summary,
+            "at": Utc::now()
+        }),
+    )?;
+    Ok(Some(tx.signal.summary))
+}
+
+/// Check if the stated goal has been achieved by asking a verifier.
+fn check_goal_achieved(root: &Path, config: &Config, goal: &str, pane: bool) -> Result<bool> {
+    let spec = dialec_dir(root)
+        .join("session")
+        .join("phase-spec")
+        .join("final.md");
+    let tx = run_role(
+        root,
+        config,
+        RoleRun {
+            phase: "implement",
+            role: "verifier",
+            pod: None,
+            workspace: root,
+            task: format!(
+                "Goal check: Has this goal been achieved?\n\nGoal: {}\n\nReview the codebase, the frozen spec at `{}`, and the implementation. If the goal is achieved, approve. If not, reject with specific objections about what's missing.",
+                goal,
+                spec.display()
+            ),
+            artifacts: existing(vec![spec]),
+            sandbox: "read-only",
+            approval: "never",
+            pane,
+        },
+    )?;
+    let achieved = signal_converged(&tx.signal);
+    log_timeline(
+        root,
+        json!({
+            "event": "goal-check",
+            "goal": goal,
+            "achieved": achieved,
+            "verdict": tx.signal.verdict,
+            "summary": tx.signal.summary,
+            "at": Utc::now()
+        }),
+    )?;
+    Ok(achieved)
 }
 
 fn handle_deadlock(

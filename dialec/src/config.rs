@@ -128,6 +128,8 @@ pub fn default_config() -> Config {
             per_phase_max_usd: None,
             max_hours: None,
             max_turns: None,
+            deadline: None,
+            work_until: None,
         },
         reminders: default_reminders(),
         workflows: default_workflows(),

@@ -106,8 +106,13 @@ struct StartArgs {
     mode: Mode,
     #[arg(long)]
     goal: Option<String>,
+    /// Budget: "$10", "4h", "until 8am ET", or combine: "$10, until 8am ET"
     #[arg(long)]
     budget: Option<String>,
+    /// Keep working until this time, finding new work when phases complete.
+    /// Shorthand for --budget "until <TIME>". Examples: "8am ET", "6:30am", "22:00"
+    #[arg(long)]
+    until: Option<String>,
     #[arg(long)]
     skip_check: bool,
     #[arg(long)]
@@ -427,7 +432,14 @@ fn cmd_start(root: PathBuf, args: StartArgs) -> Result<()> {
         && args.goal.is_some()
         && !args.no_drive
         && !args.drive;
-    let state = start_session(&root, &args.mode.to_string(), args.goal, args.budget)?;
+    // Merge --until into --budget if provided
+    let budget = match (args.budget, args.until) {
+        (Some(b), Some(u)) => Some(format!("{b}, until {u}")),
+        (Some(b), None) => Some(b),
+        (None, Some(u)) => Some(format!("until {u}")),
+        (None, None) => None,
+    };
+    let state = start_session(&root, &args.mode.to_string(), args.goal, budget)?;
     println!("started session {}", state.session_id);
     println!("session root: {}", dialec_dir(&root).display());
     if should_drive {

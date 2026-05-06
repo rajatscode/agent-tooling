@@ -195,6 +195,13 @@ pub struct BudgetConfig {
     pub per_phase_max_usd: Option<f64>,
     pub max_hours: Option<f64>,
     pub max_turns: Option<u32>,
+    /// Absolute deadline (UTC). Session refuses new turns after this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+    /// Minimum time to keep working. When phases complete before this,
+    /// the orchestrator loops back to find more work (hackathon mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
