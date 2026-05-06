@@ -692,6 +692,23 @@ Coordinate, dispatch, read artifacts, and make convergence decisions. Do not dir
 ## Audit
 
 Every material action must go through Dialec commands or be written into `.dialec/log/decisions.jsonl` via the appropriate command. Do not rely on memory outside `.dialec/`.
+
+## Git Discipline
+
+Commit and push regularly. Do not let work accumulate uncommitted.
+
+- **After every converged phase**: commit all changes with a descriptive message and push.
+- **After every pod merge**: commit the merge and push.
+- **After writing a spec or major artifact**: commit and push.
+- **Before starting a new phase**: ensure the working tree is clean.
+
+```bash
+git add -A && git commit -m "dialec: <what changed>" && git push
+```
+
+If the remote rejects the push (e.g. diverged history), do NOT force push. Commit locally and flag it in `.dialec/session/escalation.md` for the user to resolve.
+
+This ensures overnight work is never lost to a crash, and the user can see progress from another machine.
 "#
 }
 

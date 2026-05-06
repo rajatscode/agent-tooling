@@ -237,6 +237,7 @@ fn drive_spec(
                 root,
                 json!({"event": "phase-converged", "phase": "spec", "round": round, "at": Utc::now()}),
             )?;
+            commit_and_push(root, "dialec: spec phase converged");
             return Ok(());
         }
     }
@@ -334,6 +335,7 @@ fn drive_implementation(
         root,
         json!({"event": "phase-converged", "phase": "implement", "at": Utc::now()}),
     )?;
+    commit_and_push(root, "dialec: implementation phase converged");
     Ok(())
 }
 
@@ -418,6 +420,7 @@ fn merge_pod_results(root: &Path, config: &Config, results: &[PodResult]) -> Res
             root,
             json!({"event": "pod-integrated", "phase": "implement", "pod": result.name, "branch": result.branch, "at": Utc::now()}),
         )?;
+        commit_and_push(root, &format!("dialec: pod {} merged", result.name));
         if config.workspaces.keep_failed_workspaces {
             let _ = git::remove_worktree(root, &result.worktree_name, false);
         } else {
@@ -794,6 +797,7 @@ fn drive_cleanup(
                 root,
                 json!({"event": "phase-converged", "phase": "cleanup", "round": round, "at": Utc::now()}),
             )?;
+            commit_and_push(root, "dialec: cleanup phase converged");
             return Ok(());
         }
     }
@@ -1417,6 +1421,52 @@ fn check_goal_achieved(root: &Path, config: &Config, goal: &str, pane: bool) -> 
         }),
     )?;
     Ok(achieved)
+}
+
+/// Commit and push all changes. Called after each phase converges.
+/// Failures are logged but not fatal — the session continues.
+fn commit_and_push(root: &Path, message: &str) {
+    if !git::is_git_repo(root) {
+        return;
+    }
+    if let Ok(committed) = git::commit_all(root, message) {
+        if committed {
+            log_timeline(
+                root,
+                json!({"event": "auto-commit", "message": message, "at": Utc::now()}),
+            )
+            .ok();
+            // Push (non-fatal on failure)
+            let push = Command::new("git")
+                .args(["push"])
+                .current_dir(root)
+                .output();
+            match push {
+                Ok(output) if output.status.success() => {
+                    log_timeline(
+                        root,
+                        json!({"event": "auto-push", "status": "ok", "at": Utc::now()}),
+                    )
+                    .ok();
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log_timeline(
+                        root,
+                        json!({"event": "auto-push", "status": "failed", "error": stderr.trim(), "at": Utc::now()}),
+                    )
+                    .ok();
+                }
+                Err(e) => {
+                    log_timeline(
+                        root,
+                        json!({"event": "auto-push", "status": "error", "error": e.to_string(), "at": Utc::now()}),
+                    )
+                    .ok();
+                }
+            }
+        }
+    }
 }
 
 fn handle_deadlock(
