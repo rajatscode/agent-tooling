@@ -310,4 +310,5 @@ pub struct RunRequest {
     pub artifacts: Vec<PathBuf>,
     pub max_budget_usd: Option<f64>,
     pub max_turns: Option<u32>,
+    pub pane: bool,
 }

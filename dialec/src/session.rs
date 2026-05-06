@@ -447,39 +447,75 @@ Your output must preserve auditability and end with the required structured conv
 fn sidecar_skill() -> &'static str {
     r#"# Dialec Sidecar Skill
 
-You have access to `dialec` for multi-harness orchestration. In sidecar mode, the live Claude Code session is the coordinator: you think with the user, call Dialec commands when another harness should participate, and keep the user in the loop.
+You are the coordinator in a Dialec sidecar session. You think with the user and dispatch work to other harnesses (Codex, Gemini, Cursor) via `dialec`. You are never blocked waiting for a child — children run in tmux panes and you get notified when they finish.
+
+## Spawning Children (NON-BLOCKING)
+
+CRITICAL: Always use `--pane` to spawn children non-blocking. Never use `dialec run` without `--pane` — it blocks you.
+
+**Pattern for every child dispatch:**
+
+1. Spawn the child (returns immediately):
+```bash
+dialec run --harness codex --role spec-reviewer --phase spec \
+  --task "Review this spec..." --artifact path/to/spec.md \
+  --sandbox read-only --timeout-seconds 120 --pane
+```
+
+2. Immediately start a background watcher (use `run_in_background: true`):
+```bash
+TURN=0001-codex-spec-reviewer
+while [ ! -f .dialec/session/turns/$TURN/signal.json ] || grep -q '"pending"' .dialec/session/turns/$TURN/signal.json 2>/dev/null; do sleep 2; done && dialec inbox coordinator
+```
+
+3. Continue working — talk to the user, spawn more children, do whatever.
+
+4. When the background watcher completes, read the result from its output. The coordinator inbox has the child's verdict and summary.
+
+**Spawning multiple children in parallel:** Run steps 1-2 for each child. Each gets its own background watcher. You stay unblocked.
+
+## Sending Messages to Children
+
+- `dialec send --to <role> "message"` — send a directive/question to a child's inbox
+- `dialec send --to <role> --kind question "..."` — typed: directive, question, update, cancel, nudge
+- `dialec send --to <role> --ping "..."` — also nudges the child's tmux pane
+- Messages are injected into the child's prompt at the start of their next turn
+
+## Reading Child Responses
+
+- `dialec inbox coordinator` — read all messages from children
+- `dialec inbox <role>` — read messages TO a specific role
+- Children write to the coordinator channel when they finish (via `dialec finalize`)
 
 ## Commands
 
-- `dialec status` checks session phase, mode, budget, coordinator state, and current goal.
-- `dialec run --harness codex --role spec-reviewer --task "..." --artifact path` dispatches a single audited turn.
-- `dialec spec`, `dialec implement`, and `dialec cleanup` run the deterministic phase runner for one phase when the user wants local autopilot.
-- `dialec drive` continues from the current phase to done through the deterministic runner.
-- `dialec log --phase spec` reads timeline events.
-- `dialec worktree create <name>` and `dialec worktree remove <name>` manage Dialec-owned worktrees.
-- `dialec advance --reason "..."` records a user override.
-- `dialec retry --hint "..."` records a retry decision.
-- `dialec release` hands the session to the autonomous headless coordinator.
-- `dialec cron tick --role <role>` prints and records the role/rules reminder for a role.
+- `dialec run --pane ...` — spawn a non-blocking child in a tmux pane
+- `dialec send --to <role> "msg"` — send message to child
+- `dialec inbox coordinator` — read child responses
+- `dialec status` — session state
+- `dialec log --phase spec` — timeline events
+- `dialec worktree create/remove <name>` — manage worktrees
+- `dialec advance --reason "..."` — force past deadlock (user decision only)
+- `dialec release` — hand off to autonomous headless coordinator
+- `dialec drive` / `dialec spec` / `dialec implement` / `dialec cleanup` — deterministic local autopilot (blocks until done)
 
-## Sidecar Workflow
+## Phase Workflow
 
-1. Co-author or revise the spec with the user.
-2. Dispatch adversarial review with `dialec run` when the spec should be challenged.
-3. Read the resulting transaction, signal, artifacts, and `.dialec/session/objections.jsonl`.
-4. Present blocking objections to the user plainly; do not hide dissent.
-5. Repeat until no open blocking spec objections remain and the user has approved.
-6. Move to implementation: slice pods, create worktrees, dispatch implementers/verifiers, and merge only converged pods.
-7. Run meta-verification, deslopping, cleanup/refactor, adversarial cleanup review, and final integration.
-8. Use `dialec drive` only when the user explicitly wants the deterministic runner to take over a stretch of the workflow.
+1. Co-author the spec with the user.
+2. Spawn adversarial review child (`--pane`), start background watcher.
+3. When watcher returns, read objections from `dialec inbox coordinator`.
+4. Present objections to user. Iterate until converged.
+5. Implementation: create worktrees, spawn implementer children in parallel.
+6. Spawn verifier/meta-verifier/deslopper children as each pod converges.
+7. Merge converged pods. Run cleanup/refactor phase.
 
 ## Convergence
 
-Converged means latest transaction succeeded, the signal verdict is `approve` or `approve-with-nits`, and the scoped objection ledger has no open blocking objections. Never force convergence yourself; use `dialec advance --reason` only for explicit user decisions.
+Converged = latest signal verdict is `approve` or `approve-with-nits` AND no open blocking objections in `.dialec/session/objections.jsonl`. Never force convergence — use `dialec advance --reason` only for explicit user decisions.
 
 ## Role Discipline
 
-Respect the active role. PM/coordinator/spec/review roles do not write source code. Implementer/refactorer roles are the only roles expected to make accepted source changes. Verifier/adversary worktrees are disposable unless Dialec explicitly promotes their changes.
+PM/coordinator/spec/review roles do not write source code. Implementer/refactorer roles own code changes. Verifier/adversary worktrees are disposable.
 "#
 }
 

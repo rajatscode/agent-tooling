@@ -20,6 +20,7 @@ pub struct DriveOptions {
     pub max_parallel: usize,
     pub phase: Option<String>,
     pub no_cleanup: bool,
+    pub pane: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +53,7 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
     } else {
         configured_rounds
     };
+    let pane = options.pane;
     if options.max_parallel > 1 {
         log_decision(
             root,
@@ -71,13 +73,13 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
             .unwrap_or_else(|| state.current_phase.clone());
         match phase.as_str() {
             "spec" => {
-                drive_spec(root, &config, &mut state, max_rounds)?;
+                drive_spec(root, &config, &mut state, max_rounds, pane)?;
                 if options.phase.is_some() {
                     break;
                 }
             }
             "implement" => {
-                drive_implementation(root, &config, &mut state, max_rounds, options.max_parallel)?;
+                drive_implementation(root, &config, &mut state, max_rounds, options.max_parallel, pane)?;
                 if options.phase.is_some() {
                     break;
                 }
@@ -88,7 +90,7 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
                     write_state(root, &state)?;
                     break;
                 }
-                drive_cleanup(root, &config, &mut state, max_rounds)?;
+                drive_cleanup(root, &config, &mut state, max_rounds, pane)?;
                 break;
             }
             "done" => break,
@@ -106,6 +108,7 @@ fn drive_spec(
     config: &Config,
     state: &mut DialecState,
     max_rounds: u32,
+    pane: bool,
 ) -> Result<()> {
     let phase_dir = dialec_dir(root).join("session").join("phase-spec");
     ensure_dir(&phase_dir)?;
@@ -135,6 +138,7 @@ fn drive_spec(
                     ]),
                     sandbox: "workspace-write",
                     approval: "never",
+                    pane,
                 },
             )?;
             promote_final_message(root, &tx, &draft)?;
@@ -157,6 +161,7 @@ fn drive_spec(
                 artifacts: existing(vec![phase_dir.join("goal.md"), draft.clone()]),
                 sandbox: "read-only",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &review)?;
@@ -202,6 +207,7 @@ fn drive_spec(
             None,
             root,
             existing(vec![phase_dir.join("goal.md")]),
+            pane,
         )?
     {
         let final_spec = phase_dir.join("final.md");
@@ -237,6 +243,7 @@ fn drive_implementation(
     state: &mut DialecState,
     max_rounds: u32,
     max_parallel: usize,
+    pane: bool,
 ) -> Result<()> {
     if !git::is_git_repo(root) {
         return Err(anyhow!("implementation phase requires a git repository"));
@@ -252,10 +259,10 @@ fn drive_implementation(
     }
     let plan = load_or_create_pod_plan(root, &spec)?;
 
-    let pod_results = drive_pods(root, config, plan.pods, &spec, max_rounds, max_parallel)?;
+    let pod_results = drive_pods(root, config, plan.pods, &spec, max_rounds, max_parallel, pane)?;
     merge_pod_results(root, config, &pod_results)?;
 
-    drive_integration_gate(root, config, &spec)?;
+    drive_integration_gate(root, config, &spec, pane)?;
 
     write_gate_record(
         root,
@@ -295,12 +302,13 @@ fn drive_pods(
     spec: &Path,
     max_rounds: u32,
     max_parallel: usize,
+    pane: bool,
 ) -> Result<Vec<PodResult>> {
     let width = max_parallel.max(1).min(pods.len().max(1));
     if width == 1 || pods.len() <= 1 {
         return pods
             .iter()
-            .map(|pod| drive_pod(root, config, pod, spec, max_rounds))
+            .map(|pod| drive_pod(root, config, pod, spec, max_rounds, pane))
             .collect();
     }
 
@@ -320,7 +328,7 @@ fn drive_pods(
         let chunk_results = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(chunk.len());
             for pod in chunk {
-                handles.push(scope.spawn(move || drive_pod(root, config, pod, spec, max_rounds)));
+                handles.push(scope.spawn(move || drive_pod(root, config, pod, spec, max_rounds, pane)));
             }
 
             let mut chunk_results = Vec::with_capacity(handles.len());
@@ -383,6 +391,7 @@ fn drive_pod(
     pod: &Pod,
     spec: &Path,
     max_rounds: u32,
+    pane: bool,
 ) -> Result<PodResult> {
     let pod_dir = dialec_dir(root)
         .join("session")
@@ -420,6 +429,7 @@ fn drive_pod(
                 artifacts: existing(vec![spec.to_path_buf(), spec_slice.clone()]),
                 sandbox: "workspace-write",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &status)?;
@@ -449,6 +459,7 @@ fn drive_pod(
                 artifacts: existing(vec![spec.to_path_buf(), spec_slice.clone(), status.clone()]),
                 sandbox: "workspace-write",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &verify_report)?;
@@ -462,7 +473,7 @@ fn drive_pod(
             continue;
         }
 
-        if drive_post_impl_reviews(root, config, pod, spec, &impl_worktree, &pod_dir, round)? {
+        if drive_post_impl_reviews(root, config, pod, spec, &impl_worktree, &pod_dir, round, pane)? {
             log_timeline(
                 root,
                 json!({"event": "pod-converged", "phase": "implement", "pod": pod.name, "branch": impl_branch, "round": round, "at": Utc::now()}),
@@ -483,6 +494,7 @@ fn drive_pod(
             Some(&pod.name),
             &impl_worktree,
             existing(vec![spec.to_path_buf(), spec_slice]),
+            pane,
         )?
         && Ledger::read(root)?
             .open_blocking("implement", Some(&pod.name))
@@ -507,6 +519,7 @@ fn drive_post_impl_reviews(
     impl_worktree: &Path,
     pod_dir: &Path,
     round: u32,
+    pane: bool,
 ) -> Result<bool> {
     let meta = pod_dir.join("meta-verify.md");
     let deslop = pod_dir.join("deslop.md");
@@ -529,6 +542,7 @@ fn drive_post_impl_reviews(
             ]),
             sandbox: "read-only",
             approval: "never",
+            pane,
         },
     )?;
     promote_final_message(root, &tx_meta, &meta)?;
@@ -549,6 +563,7 @@ fn drive_post_impl_reviews(
             artifacts: existing(vec![spec.to_path_buf(), meta.clone()]),
             sandbox: "read-only",
             approval: "never",
+            pane,
         },
     )?;
     promote_final_message(root, &tx_deslop, &deslop)?;
@@ -579,6 +594,7 @@ fn drive_post_impl_reviews(
             artifacts: existing(vec![spec.to_path_buf(), meta, deslop]),
             sandbox: "workspace-write",
             approval: "never",
+            pane,
         },
     )?;
     promote_final_message(root, &tx_response, &response)?;
@@ -597,6 +613,7 @@ fn drive_cleanup(
     config: &Config,
     state: &mut DialecState,
     max_rounds: u32,
+    pane: bool,
 ) -> Result<()> {
     if !git::is_git_repo(root) {
         return Err(anyhow!("cleanup phase requires a git repository"));
@@ -629,6 +646,7 @@ fn drive_cleanup(
                 artifacts: existing(vec![spec.clone()]),
                 sandbox: "workspace-write",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &analysis)?;
@@ -674,6 +692,7 @@ fn drive_cleanup(
                 ]),
                 sandbox: "workspace-write",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &changes)?;
@@ -695,6 +714,7 @@ fn drive_cleanup(
                 artifacts: existing(vec![spec.clone(), analysis.clone(), changes.clone()]),
                 sandbox: "workspace-write",
                 approval: "never",
+                pane,
             },
         )?;
         promote_final_message(root, &tx, &review)?;
@@ -744,6 +764,7 @@ fn drive_cleanup(
             None,
             &cleanup_worktree,
             existing(vec![spec, analysis]),
+            pane,
         )?
         && Ledger::read(root)?
             .open_blocking("cleanup", None)
@@ -780,6 +801,7 @@ struct RoleRun<'a> {
     artifacts: Vec<PathBuf>,
     sandbox: &'a str,
     approval: &'a str,
+    pane: bool,
 }
 
 fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransaction> {
@@ -801,6 +823,7 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         artifacts: run.artifacts,
         max_budget_usd: Some(config.budget.per_turn_max_usd),
         max_turns: config.budget.max_turns,
+        pane: run.pane,
     })?;
     log_timeline(
         root,
@@ -890,6 +913,7 @@ fn run_arbiter(
     pod: Option<&str>,
     workspace: &Path,
     artifacts: Vec<PathBuf>,
+    pane: bool,
 ) -> Result<bool> {
     if !config.roles.contains_key("arbiter") {
         log_decision(
@@ -923,6 +947,7 @@ fn run_arbiter(
             artifacts,
             sandbox: "read-only",
             approval: "never",
+            pane,
         },
     )?;
     Ok(signal_converged(&tx.signal) && Ledger::read(root)?.open_blocking(phase, pod).is_empty())
@@ -1023,7 +1048,7 @@ fn write_gate_record(
     Ok(())
 }
 
-fn drive_integration_gate(root: &Path, config: &Config, spec: &Path) -> Result<()> {
+fn drive_integration_gate(root: &Path, config: &Config, spec: &Path, pane: bool) -> Result<()> {
     let phase_dir = dialec_dir(root).join("session").join("phase-impl");
     ensure_dir(&phase_dir)?;
     let verification_report = phase_dir.join("verification-commands.jsonl");
@@ -1046,6 +1071,7 @@ fn drive_integration_gate(root: &Path, config: &Config, spec: &Path) -> Result<(
             artifacts: existing(vec![spec.to_path_buf(), verification_report]),
             sandbox: "workspace-write",
             approval: "never",
+            pane,
         },
     )?;
     promote_final_message(root, &tx, &integration_review)?;

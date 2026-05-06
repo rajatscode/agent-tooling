@@ -115,6 +115,58 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     write_json_pretty(&turn_dir.join("command.json"), &command)?;
     write_json_pretty(&turn_dir.join("before.json"), &before)?;
 
+    // Pane mode: spawn and return immediately. Finalization happens in the pane via `dialec finalize`.
+    if req.pane && is_tmux_available() {
+        let pane_id = spawn_tmux_pane(&program, &cwd, &turn_dir, &req, &task, &schema_file, &final_message_path)?;
+        // Return a pending transaction — the pane will finalize it
+        let pending = RunTransaction {
+            id: turn_id.clone(),
+            phase: req.phase.clone(),
+            pod: req.pod.clone(),
+            role: req.role.clone(),
+            harness: req.harness.clone(),
+            harness_version: capabilities.version,
+            workspace: req.workspace.to_string_lossy().to_string(),
+            started_at,
+            completed_at: started_at, // not yet completed
+            command,
+            input_artifacts,
+            before: before.clone(),
+            after: before,
+            stdout: artifact_ref(&turn_dir.join("stdout.log"), &req.project_root, "stdout")?,
+            stderr: artifact_ref(&turn_dir.join("stderr.log"), &req.project_root, "stderr")?,
+            event_log: None,
+            final_message: artifact_ref(&final_message_path, &req.project_root, "final-message")?,
+            structured: artifact_ref(&turn_dir.join("structured.json"), &req.project_root, "report")?,
+            signal: ConvergenceSignal {
+                verdict: "pending".to_string(),
+                summary: format!("running in tmux pane {pane_id}"),
+                objections: vec![],
+                resolved_objection_ids: vec![],
+                new_objection_ids: vec![],
+            },
+            patch: artifact_ref(&turn_dir.join("patch.diff"), &req.project_root, "patch")?,
+            cost: None,
+            resume_from,
+            session_id: None,
+            exit_code: -1,
+            error: None,
+        };
+        write_json_pretty(&turn_dir.join("transaction.json"), &pending)?;
+        // Write pane metadata so finalize can find it
+        write_json_pretty(&turn_dir.join("pane.json"), &json!({
+            "paneId": pane_id,
+            "harness": req.harness,
+            "role": req.role,
+            "phase": req.phase,
+            "pod": req.pod,
+            "workspace": req.workspace,
+            "projectRoot": req.project_root,
+            "status": "running",
+        }))?;
+        return Ok(pending);
+    }
+
     let output = run_external(&program, &args, &cwd, req.timeout_ms)?;
     fs::write(turn_dir.join("stdout.log"), &output.stdout)?;
     fs::write(turn_dir.join("stderr.log"), &output.stderr)?;
@@ -244,6 +296,102 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     Ok(transaction)
 }
 
+/// Finalize a pane-mode turn after the harness exits.
+/// Called by the pane script via `dialec finalize --turn <id>`.
+pub fn finalize_turn(root: &Path, turn_id: &str) -> Result<RunTransaction> {
+    let turn_dir = dialec_dir(root).join("session").join("turns").join(turn_id);
+    if !turn_dir.exists() {
+        anyhow::bail!("turn directory not found: {}", turn_dir.display());
+    }
+
+    let final_message_path = turn_dir.join("final-message.md");
+    let stdout_path = turn_dir.join("stdout.log");
+    let stderr_path = turn_dir.join("stderr.log");
+    let exit_code_path = turn_dir.join(".exit-code");
+
+    // Read exit code
+    let exit_code = if exit_code_path.exists() {
+        fs::read_to_string(&exit_code_path)
+            .unwrap_or_default()
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+
+    // Read whatever output we have
+    let final_message = fs::read_to_string(&final_message_path).unwrap_or_default();
+    let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
+
+    // Try to extract signal from final message or stdout
+    let structured_value = extract_signal_from_text(&final_message)
+        .or_else(|| extract_last_jsonl_message(&stdout_text))
+        .or_else(|| extract_signal_from_text(&stdout_text));
+
+    let (structured_value, signal, signal_error) = match structured_value {
+        Some(value) => match parse_signal(&value) {
+            Ok(signal) => (value, signal, None),
+            Err(error) => {
+                let signal = fallback_reject_signal(
+                    "dialec-invalid-structured-signal",
+                    format!("invalid structured convergence signal: {error}"),
+                );
+                (json!({"parseError": error.to_string()}), signal, Some(error.to_string()))
+            }
+        },
+        None => {
+            let signal = fallback_reject_signal(
+                "dialec-missing-structured-signal",
+                "interactive pane did not produce a structured convergence signal",
+            );
+            (json!(null), signal, Some("missing structured signal".to_string()))
+        }
+    };
+
+    write_json_pretty(&turn_dir.join("structured.json"), &structured_value)?;
+    write_json_pretty(&turn_dir.join("signal.json"), &signal)?;
+
+    // Read the pending transaction and update it
+    let mut tx: RunTransaction = crate::fsutil::read_json(&turn_dir.join("transaction.json"))?;
+    tx.completed_at = Utc::now();
+    tx.exit_code = exit_code;
+    tx.signal = signal.clone();
+    if exit_code != 0 && signal_error.is_none() {
+        tx.error = Some(HarnessError {
+            kind: "process-exit".to_string(),
+            message: format!("harness exited with code {exit_code}"),
+        });
+    } else if let Some(err) = signal_error {
+        tx.error = Some(HarnessError {
+            kind: "structured-output".to_string(),
+            message: err,
+        });
+    }
+
+    // Update workspace snapshot
+    tx.after = snapshot(Path::new(&tx.workspace));
+    write_json_pretty(&turn_dir.join("after.json"), &tx.after)?;
+
+    // Write finalized transaction
+    write_json_pretty(&turn_dir.join("transaction.json"), &tx)?;
+
+    // Update pane metadata
+    let pane_json = turn_dir.join("pane.json");
+    if pane_json.exists() {
+        let mut pane: serde_json::Value = crate::fsutil::read_json(&pane_json)?;
+        pane["status"] = json!("completed");
+        pane["exitCode"] = json!(exit_code);
+        pane["verdict"] = json!(tx.signal.verdict);
+        write_json_pretty(&pane_json, &pane)?;
+    }
+
+    // Update ledger
+    append_objections(root, &ledger_entries(&tx, &signal))?;
+
+    Ok(tx)
+}
+
 fn compose_task(
     req: &RunRequest,
     role_file: &Path,
@@ -290,6 +438,14 @@ fn compose_task(
         out.push_str("## Objection Ledger\n\n```jsonl\n");
         out.push_str(&fs::read_to_string(ledger).unwrap_or_default());
         out.push_str("\n```\n\n");
+    }
+
+    // Channel instructions + pending messages
+    out.push_str(&crate::channel::channel_instructions(&req.project_root, &req.role));
+    out.push_str("\n");
+    let inbox_messages = crate::channel::read_inbox(&req.project_root, &req.role).unwrap_or_default();
+    if !inbox_messages.is_empty() {
+        out.push_str(&crate::channel::format_inbox_for_prompt(&inbox_messages));
     }
 
     let scratch = dialec_dir(&req.project_root)
@@ -1180,6 +1336,179 @@ fn ledger_entries(transaction: &RunTransaction, signal: &ConvergenceSignal) -> V
     entries
 }
 
+fn is_tmux_available() -> bool {
+    std::env::var("TMUX").is_ok()
+        && Command::new("tmux")
+            .arg("list-panes")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+}
+
+fn spawn_tmux_pane(
+    program: &str,
+    cwd: &Path,
+    turn_dir: &Path,
+    req: &RunRequest,
+    task: &str,
+    schema_file: &Path,
+    final_message_path: &Path,
+) -> Result<String> {
+    let role = &req.role;
+    let pod = req.pod.as_deref();
+    let stdout_path = turn_dir.join("stdout.log");
+    let stderr_path = turn_dir.join("stderr.log");
+    let exit_code_path = turn_dir.join(".exit-code");
+
+    // Write the task prompt to a file the agent can reference
+    let prompt_path = turn_dir.join("prompt.md");
+    fs::write(&prompt_path, task)?;
+
+    // Build an INTERACTIVE command per harness (no --json, no -p)
+    let script_path = turn_dir.join("pane-run.sh");
+    let mut script = String::new();
+    script.push_str("#!/bin/bash\n");
+    script.push_str(&format!("cd '{}'\n", cwd.display()));
+    script.push_str(&format!(
+        "printf '\\033[1;36m[dialec] {} role={}",
+        if pod.is_some() { format!("pod:{} ", pod.unwrap()) } else { String::new() },
+        role,
+    ));
+    script.push_str("\\033[0m\\n'\n");
+    script.push_str(&format!(
+        "printf '\\033[0;33m  inbox: .dialec/channels/{}/inbox.jsonl\\033[0m\\n'\n",
+        role
+    ));
+    script.push_str(&format!(
+        "printf '\\033[0;33m  prompt: {}\\033[0m\\n\\n'\n",
+        turn_dir.join("prompt.md").display()
+    ));
+
+    // Build interactive command per harness
+    let prompt_escaped = prompt_path.to_string_lossy().replace('\'', "'\\''");
+    let schema_escaped = schema_file.to_string_lossy().replace('\'', "'\\''");
+    let final_msg_escaped = final_message_path.to_string_lossy().replace('\'', "'\\''");
+
+    match req.harness.as_str() {
+        "claude" => {
+            // Interactive Claude with initial prompt from file
+            script.push_str(&format!(
+                "cat '{}' | '{}' \\\n  --append-system-prompt-file '{}' \\\n  --json-schema '{}' \\\n",
+                prompt_escaped,
+                program,
+                turn_dir.join("..").join("..").join("..").join("roles").join(format!("{role}.md")).display(),
+                schema_escaped,
+            ));
+            script.push_str(&format!(
+                "  2> >(tee '{}' >&2)\n",
+                stderr_path.display()
+            ));
+        }
+        "codex" => {
+            // codex exec without --json: human-readable output, auto-exits, structured signal via -o
+            script.push_str(&format!(
+                "'{}' exec \\\n  --sandbox '{}' \\\n  --cd '{}' \\\n  --output-schema '{}' \\\n  -o '{}' \\\n  \"$(cat '{}')\" \\\n",
+                program,
+                req.sandbox,
+                req.workspace.display(),
+                schema_escaped,
+                final_msg_escaped,
+                prompt_escaped,
+            ));
+            script.push_str(&format!(
+                "  2>&1 | tee '{}'\n",
+                stdout_path.display()
+            ));
+        }
+        _ => {
+            // Generic: run interactively with prompt as argument
+            script.push_str(&format!(
+                "'{}' \"$(cat '{}')\" \\\n",
+                program,
+                prompt_escaped,
+            ));
+            script.push_str(&format!(
+                "  2> >(tee '{}' >&2)\n",
+                stderr_path.display()
+            ));
+        }
+    }
+
+    // Capture parent pane ID so we can notify it when done
+    let parent_pane = Command::new("tmux")
+        .args(["display-message", "-p", "#{pane_id}"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    // After harness exits: finalize the transaction and notify coordinator + parent
+    script.push_str("EC=$?\n");
+    script.push_str(&format!("echo $EC > '{}'\n", exit_code_path.display()));
+    let turn_id = turn_dir.file_name().unwrap().to_string_lossy();
+    let project_root_escaped = req.project_root.to_string_lossy().replace('\'', "'\\''");
+    script.push_str(&format!(
+        "printf '\\n\\033[1;33m[dialec] finalizing turn {}...\\033[0m\\n'\n",
+        turn_id
+    ));
+    script.push_str(&format!(
+        "dialec finalize --turn '{}' --project '{}'\n",
+        turn_id, project_root_escaped
+    ));
+    // Notify parent pane
+    if !parent_pane.is_empty() {
+        script.push_str(&format!(
+            "VERDICT=$(cat '{}' 2>/dev/null | grep -o '\"verdict\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4)\n",
+            turn_dir.join("signal.json").display(),
+        ));
+        script.push_str(&format!(
+            "tmux send-keys -t '{}' \"\" C-c 2>/dev/null; tmux display-message -t '{}' '[dialec] {} done: '${{VERDICT:-unknown}}' — run: dialec inbox coordinator' 2>/dev/null\n",
+            parent_pane, parent_pane, turn_id,
+        ));
+    }
+    script.push_str("printf '\\033[1;33m[dialec] done. Closing in 3s...\\033[0m\\n'\n");
+    script.push_str("sleep 3\n");
+    fs::write(&script_path, &script)?;
+
+    Command::new("chmod")
+        .args(["+x", &script_path.to_string_lossy()])
+        .status()?;
+
+    let pane_title = if let Some(pod) = pod {
+        format!("dialec:{role}:{pod}")
+    } else {
+        format!("dialec:{role}")
+    };
+
+    let output = Command::new("tmux")
+        .args([
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F", "#{pane_id}",
+            &format!("bash '{}'", script_path.display()),
+        ])
+        .current_dir(cwd)
+        .output()
+        .context("failed to create tmux pane")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux split-window failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let _ = Command::new("tmux")
+        .args(["select-pane", "-t", &pane_id, "-T", &pane_title])
+        .status();
+
+    Ok(pane_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,6 +1563,7 @@ mod tests {
             artifacts: vec![],
             max_budget_usd: None,
             max_turns: None,
+            pane: false,
         };
         assert_eq!(
             resume_keys(&req),

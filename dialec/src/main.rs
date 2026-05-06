@@ -1,4 +1,5 @@
 mod capabilities;
+mod channel;
 mod config;
 mod fsutil;
 mod git;
@@ -69,6 +70,9 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    Finalize(FinalizeArgs),
+    Send(SendArgs),
+    Inbox(InboxArgs),
     Advance(DecisionArgs),
     Retry(RetryArgs),
     Intervene,
@@ -206,6 +210,9 @@ struct DriveArgs {
     max_parallel: usize,
     #[arg(long)]
     no_cleanup: bool,
+    /// Run harnesses in visible tmux panes
+    #[arg(long)]
+    pane: bool,
 }
 
 #[derive(Debug, Args)]
@@ -214,6 +221,9 @@ struct PhaseArgs {
     max_rounds: Option<u32>,
     #[arg(long, default_value_t = 1)]
     max_parallel: usize,
+    /// Run harnesses in visible tmux panes
+    #[arg(long)]
+    pane: bool,
 }
 
 #[derive(Debug, Args)]
@@ -238,6 +248,9 @@ struct RunArgs {
     timeout_seconds: u64,
     #[arg(long = "artifact")]
     artifacts: Vec<PathBuf>,
+    /// Run the harness in a visible tmux pane instead of capturing silently
+    #[arg(long)]
+    pane: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -259,6 +272,37 @@ struct WorktreeRemoveArgs {
     name: String,
     #[arg(long)]
     delete_branch: bool,
+}
+
+#[derive(Debug, Args)]
+struct FinalizeArgs {
+    /// Turn directory name (e.g. 0001-codex-spec-reviewer)
+    #[arg(long)]
+    turn: String,
+}
+
+#[derive(Debug, Args)]
+struct SendArgs {
+    /// Target role or turn id to send to
+    #[arg(long)]
+    to: String,
+    /// Message body
+    message: String,
+    /// Message kind: directive, question, update, cancel, nudge
+    #[arg(long, default_value = "directive")]
+    kind: String,
+    /// Also ping the tmux pane to check inbox
+    #[arg(long)]
+    ping: bool,
+}
+
+#[derive(Debug, Args)]
+struct InboxArgs {
+    /// Channel to read (role name or turn id)
+    target: String,
+    /// Only show messages after this id
+    #[arg(long)]
+    since: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -302,6 +346,9 @@ fn main() -> Result<()> {
         Command::Log(args) => cmd_log(root, args),
         Command::Run(args) => cmd_run(root, args),
         Command::Worktree { command } => cmd_worktree(root, command),
+        Command::Finalize(args) => cmd_finalize(root, args),
+        Command::Send(args) => cmd_send(root, args),
+        Command::Inbox(args) => cmd_inbox(root, args),
         Command::Advance(args) => cmd_advance(root, args),
         Command::Retry(args) => cmd_retry(root, args),
         Command::Intervene => cmd_intervene(root),
@@ -391,6 +438,7 @@ fn cmd_start(root: PathBuf, args: StartArgs) -> Result<()> {
                 max_parallel: args.max_parallel,
                 phase: None,
                 no_cleanup: false,
+                pane: false,
             },
         )?;
         println!("drive completed");
@@ -432,6 +480,7 @@ fn cmd_drive(root: PathBuf, args: DriveArgs) -> Result<()> {
             max_parallel: args.max_parallel,
             phase: args.phase,
             no_cleanup: args.no_cleanup,
+            pane: args.pane,
         },
     )?;
     println!("drive completed");
@@ -447,6 +496,7 @@ fn cmd_phase(root: PathBuf, phase: &str, args: PhaseArgs) -> Result<()> {
             max_parallel: args.max_parallel,
             phase: Some(phase.to_string()),
             no_cleanup: false,
+            pane: args.pane,
         },
     )?;
     println!("{phase} completed");
@@ -547,6 +597,7 @@ fn cmd_run(root: PathBuf, args: RunArgs) -> Result<()> {
         max_turns: read_state(&root)
             .ok()
             .and_then(|state| state.budget.max_turns),
+        pane: args.pane,
     };
     let tx = run_transaction(req)?;
     log_timeline(
@@ -610,6 +661,123 @@ fn cmd_worktree(root: PathBuf, command: WorktreeCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_finalize(root: PathBuf, args: FinalizeArgs) -> Result<()> {
+    let tx = transaction::finalize_turn(&root, &args.turn)?;
+    // Notify the coordinator channel
+    channel::send_message(
+        &root,
+        &tx.role,
+        "coordinator",
+        channel::MessageKind::Update,
+        &format!(
+            "Turn `{}` complete. Role: `{}`, harness: `{}`, verdict: `{}`.\nSummary: {}",
+            tx.id, tx.role, tx.harness, tx.signal.verdict, tx.signal.summary
+        ),
+        Some(json!({
+            "turnId": tx.id,
+            "phase": tx.phase,
+            "pod": tx.pod,
+            "verdict": tx.signal.verdict,
+            "objectionCount": tx.signal.objections.len(),
+            "exitCode": tx.exit_code,
+        })),
+    )?;
+    log_timeline(
+        &root,
+        json!({
+            "event": "turn-finalized",
+            "transactionId": tx.id,
+            "phase": tx.phase,
+            "pod": tx.pod,
+            "role": tx.role,
+            "harness": tx.harness,
+            "verdict": tx.signal.verdict,
+            "exitCode": tx.exit_code,
+            "at": tx.completed_at,
+        }),
+    )?;
+    println!("finalized {}: verdict={}", tx.id, tx.signal.verdict);
+    Ok(())
+}
+
+fn cmd_send(root: PathBuf, args: SendArgs) -> Result<()> {
+    let kind = match args.kind.as_str() {
+        "directive" => channel::MessageKind::Directive,
+        "question" => channel::MessageKind::Question,
+        "update" => channel::MessageKind::Update,
+        "cancel" => channel::MessageKind::Cancel,
+        "nudge" => channel::MessageKind::Nudge,
+        other => anyhow::bail!("unknown message kind: {other}; use directive/question/update/cancel/nudge"),
+    };
+    let msg = channel::send_message(&root, "coordinator", &args.to, kind, &args.message, None)?;
+    log_timeline(
+        &root,
+        json!({
+            "event": "message-sent",
+            "messageId": msg.id,
+            "from": msg.from,
+            "to": msg.to,
+            "kind": args.kind,
+            "at": msg.at
+        }),
+    )?;
+    println!("sent {} to {}: {}", args.kind, args.to, msg.id);
+
+    // If --ping and we're in tmux, send a keystroke to the target pane to trigger inbox check
+    if args.ping {
+        ping_pane(&args.to);
+    }
+    Ok(())
+}
+
+fn cmd_inbox(root: PathBuf, args: InboxArgs) -> Result<()> {
+    let messages = channel::read_inbox_since(&root, &args.target, args.since.as_deref())?;
+    if messages.is_empty() {
+        println!("no messages for {}", args.target);
+        return Ok(());
+    }
+    for msg in &messages {
+        println!(
+            "[{}] {} → {}: {}",
+            msg.kind, msg.from, msg.to, msg.body
+        );
+    }
+    Ok(())
+}
+
+/// Ping a tmux pane to remind the agent to check its inbox.
+/// This writes a visible reminder to the pane's stdin if possible.
+fn ping_pane(target: &str) {
+    // Find panes with the target name in their title
+    let pane_id = find_pane_by_title(target);
+    if let Some(pane) = pane_id {
+        // Send a newline + visible message via tmux
+        let msg = format!(
+            "echo '\\n\\033[1;33m[dialec] New message in inbox. Run: cat .dialec/channels/{}/inbox.jsonl | tail -1 | jq .\\033[0m'",
+            target
+        );
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, &msg, "Enter"])
+            .status();
+    }
+}
+
+fn find_pane_by_title(target: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id}:#{pane_title}"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some((id, title)) = line.split_once(':') {
+            if title.contains(target) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn cmd_advance(root: PathBuf, args: DecisionArgs) -> Result<()> {
@@ -1003,6 +1171,7 @@ fn run_custom_workflow(
                     max_parallel: 1,
                     phase: Some(phase.name.clone()),
                     no_cleanup: false,
+                    pane: false,
                 },
             )?;
             continue;
@@ -1045,6 +1214,7 @@ fn run_custom_workflow(
                     artifacts,
                     max_budget_usd: Some(config.budget.per_turn_max_usd),
                     max_turns: config.budget.max_turns,
+                    pane: false,
                 })?;
                 log_timeline(
                     root,

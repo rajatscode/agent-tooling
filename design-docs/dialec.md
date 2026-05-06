@@ -939,6 +939,58 @@ recorded as transactions — the user can review and continue from any
 point. When switching from sidecar → autonomous, dialec spawns the
 coordinator with the full session context.
 
+### Tmux Pane Model (target UX)
+
+Dialec agents should feel like Claude Code teammates done right:
+each pod/turn gets a **visible tmux pane** where you watch the agent
+work in real-time. Not hidden background processes — visible,
+non-blocking, killable work.
+
+```
+┌─────────────────────────┬─────────────────────────┐
+│ Pane 0: Your Claude     │ Pane 1: Codex (auth)    │
+│ session (coordinator)   │ implementing...          │
+│                         │ > writing src/auth.rs    │
+│ You + Claude co-author  │ > running cargo check    │
+│ spec, dispatch pods     │ > producing signal...    │
+├─────────────────────────┼─────────────────────────┤
+│ Pane 2: Claude (verify) │ Pane 3: Codex (logging) │
+│ verifying auth pod...   │ implementing...          │
+│ > reading impl diff     │ > writing src/log.rs     │
+│ > running tests         │ > done ✓ approve         │
+└─────────────────────────┴─────────────────────────┘
+```
+
+**Properties:**
+- **Visible.** You see each agent working in real-time. Not hidden.
+- **Non-blocking.** Each agent is in its own pane. Parent is never
+  waiting on a child.
+- **Parent-aware.** Child panes know which session spawned them and
+  report back via the transaction/signal system.
+- **Killable.** Ctrl-C any pane to abort that turn. The conductor
+  records it as a failed transaction.
+- **Persistent.** Panes stay open after completion showing the result
+  until you dismiss them (or auto-close on approve).
+
+**Implementation:**
+```bash
+# Sidecar mode with tmux panes:
+dialec run --harness codex --role implementer --task "..." --pane
+
+# Or the phase runner spawns panes automatically:
+dialec implement --max-parallel 4 --pane
+
+# Each pane runs the harness directly with live output,
+# while dialec captures the transaction in the background.
+```
+
+The `--pane` flag tells dialec to `tmux split-window` instead of
+capturing stdout silently. The harness runs in the pane with live
+output visible to the user. Dialec tees the output to the transaction
+directory simultaneously. When the turn completes, the pane shows the
+verdict and the parent session is notified via a tmux hook or
+file-watch.
+
 ### Legacy interactive (manual dispatch)
 
 For debugging or unusual workflows, the user can still manually drive
