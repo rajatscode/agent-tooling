@@ -1,0 +1,1182 @@
+mod capabilities;
+mod config;
+mod fsutil;
+mod git;
+mod ledger;
+mod model;
+mod orchestrator;
+mod schema;
+mod session;
+mod transaction;
+
+use anyhow::{Context, Result};
+use capabilities::{probe_all, probe_harness};
+use chrono::Utc;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use config::load_or_default;
+use fsutil::{dialec_dir, project_root};
+use ledger::{Ledger, signal_converged};
+use model::{CoordinatorState, HarnessCapabilities, RunRequest, Workflow};
+use orchestrator::{DriveOptions, drive};
+use serde_json::{Value, json};
+use session::{
+    ensure_layout, log_cost, log_decision, log_timeline, read_state, start_session, write_state,
+};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::Duration;
+use transaction::run_transaction;
+
+#[derive(Debug, Parser)]
+#[command(name = "dialec")]
+#[command(about = "Multi-harness orchestrator for structured agent collaboration")]
+#[command(version)]
+struct Cli {
+    #[arg(long, global = true, value_name = "PATH")]
+    project: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Init(InitArgs),
+    Check(CheckArgs),
+    Harnesses(HarnessesArgs),
+    Start(StartArgs),
+    Drive(DriveArgs),
+    Spec(PhaseArgs),
+    Implement(PhaseArgs),
+    Cleanup(PhaseArgs),
+    Tail(TailArgs),
+    Cron {
+        #[command(subcommand)]
+        command: CronCommand,
+    },
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+    Status(StatusArgs),
+    Log(LogArgs),
+    Run(RunArgs),
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+    Advance(DecisionArgs),
+    Retry(RetryArgs),
+    Intervene,
+    Release,
+    Resume(ResumeArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckArgs {
+    #[arg(long)]
+    no_write: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HarnessesArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StartArgs {
+    #[arg(long, value_enum, default_value_t = Mode::Sidecar)]
+    mode: Mode,
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long)]
+    budget: Option<String>,
+    #[arg(long)]
+    skip_check: bool,
+    #[arg(long)]
+    no_drive: bool,
+    #[arg(long)]
+    drive: bool,
+    #[arg(long)]
+    foreground: bool,
+    #[arg(long, default_value_t = 1)]
+    max_parallel: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Mode {
+    Sidecar,
+    Interactive,
+    Autonomous,
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Mode::Sidecar => write!(f, "sidecar"),
+            Mode::Interactive => write!(f, "interactive"),
+            Mode::Autonomous => write!(f, "autonomous"),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct TailArgs {
+    #[arg(long)]
+    turn: Option<String>,
+    #[arg(long)]
+    coordinator: bool,
+    #[arg(short, long)]
+    follow: bool,
+    #[arg(long, default_value = "stdout")]
+    stream: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum CronCommand {
+    Tick(CronTickArgs),
+    List,
+}
+
+#[derive(Debug, Args)]
+struct CronTickArgs {
+    #[arg(long)]
+    role: String,
+    #[arg(long, default_value = "spec")]
+    phase: String,
+    #[arg(long)]
+    pod: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    List,
+    Show(WorkflowShowArgs),
+    Run(WorkflowRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorkflowShowArgs {
+    name: String,
+}
+
+#[derive(Debug, Args)]
+struct WorkflowRunArgs {
+    name: String,
+    #[arg(long)]
+    max_rounds: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LogArgs {
+    #[arg(long)]
+    phase: Option<String>,
+    #[arg(long)]
+    pod: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct DriveArgs {
+    #[arg(long)]
+    phase: Option<String>,
+    #[arg(long)]
+    max_rounds: Option<u32>,
+    #[arg(long, default_value_t = 1)]
+    max_parallel: usize,
+    #[arg(long)]
+    no_cleanup: bool,
+}
+
+#[derive(Debug, Args)]
+struct PhaseArgs {
+    #[arg(long)]
+    max_rounds: Option<u32>,
+    #[arg(long, default_value_t = 1)]
+    max_parallel: usize,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(long)]
+    harness: String,
+    #[arg(long)]
+    role: String,
+    #[arg(long, default_value = "spec")]
+    phase: String,
+    #[arg(long)]
+    task: String,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    pod: Option<String>,
+    #[arg(long, default_value = "workspace-write")]
+    sandbox: String,
+    #[arg(long, default_value = "never")]
+    approval: String,
+    #[arg(long, default_value_t = 1800)]
+    timeout_seconds: u64,
+    #[arg(long = "artifact")]
+    artifacts: Vec<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    Create(WorktreeCreateArgs),
+    Remove(WorktreeRemoveArgs),
+    List,
+}
+
+#[derive(Debug, Args)]
+struct WorktreeCreateArgs {
+    name: String,
+    #[arg(long)]
+    base: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WorktreeRemoveArgs {
+    name: String,
+    #[arg(long)]
+    delete_branch: bool,
+}
+
+#[derive(Debug, Args)]
+struct DecisionArgs {
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    phase: Option<String>,
+    #[arg(long)]
+    pod: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RetryArgs {
+    #[arg(long)]
+    hint: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    session_id: Option<String>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let root = project_root(cli.project.as_deref())?;
+
+    match cli.command {
+        Command::Init(args) => cmd_init(root, args),
+        Command::Check(args) => cmd_check(root, args),
+        Command::Harnesses(args) => cmd_harnesses(root, args),
+        Command::Start(args) => cmd_start(root, args),
+        Command::Drive(args) => cmd_drive(root, args),
+        Command::Spec(args) => cmd_phase(root, "spec", args),
+        Command::Implement(args) => cmd_phase(root, "implement", args),
+        Command::Cleanup(args) => cmd_phase(root, "cleanup", args),
+        Command::Tail(args) => cmd_tail(root, args),
+        Command::Cron { command } => cmd_cron(root, command),
+        Command::Workflow { command } => cmd_workflow(root, command),
+        Command::Status(args) => cmd_status(root, args),
+        Command::Log(args) => cmd_log(root, args),
+        Command::Run(args) => cmd_run(root, args),
+        Command::Worktree { command } => cmd_worktree(root, command),
+        Command::Advance(args) => cmd_advance(root, args),
+        Command::Retry(args) => cmd_retry(root, args),
+        Command::Intervene => cmd_intervene(root),
+        Command::Release => cmd_release(root),
+        Command::Resume(args) => cmd_resume(root, args),
+    }
+}
+
+fn cmd_init(root: PathBuf, args: InitArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    if args.force {
+        session::refresh_default_prompts(&root)?;
+        println!("refreshed default role prompts and skills; existing config was preserved");
+    }
+    println!("initialized {}", dialec_dir(&root).display());
+    println!("next: dialec check");
+    Ok(())
+}
+
+fn cmd_check(root: PathBuf, args: CheckArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    let reports = probe_all(&root, !args.no_write)?;
+    let role_errors = validate_role_mappings(&root, &reports)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "harnesses": reports,
+                "roleErrors": role_errors,
+            }))?
+        );
+    } else {
+        print_harness_table(&reports);
+        if role_errors.is_empty() {
+            println!("role capability check: ok");
+        } else {
+            println!("role capability check: failed");
+            for error in &role_errors {
+                println!("  - {error}");
+            }
+        }
+    }
+
+    if !role_errors.is_empty() {
+        anyhow::bail!("role capability check failed");
+    }
+    Ok(())
+}
+
+fn cmd_harnesses(root: PathBuf, args: HarnessesArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    let reports = probe_all(&root, false)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        print_harness_table(&reports);
+    }
+    Ok(())
+}
+
+fn cmd_start(root: PathBuf, args: StartArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    if !args.skip_check {
+        let reports = probe_all(&root, true)?;
+        let role_errors = validate_role_mappings(&root, &reports)?;
+        if !role_errors.is_empty() {
+            for error in role_errors {
+                eprintln!("role capability error: {error}");
+            }
+            anyhow::bail!("dialec check failed; rerun with --skip-check only if you know why");
+        }
+    }
+    let should_drive = args.drive && !args.no_drive;
+    let should_spawn_coordinator = matches!(args.mode, Mode::Autonomous)
+        && args.goal.is_some()
+        && !args.no_drive
+        && !args.drive;
+    let state = start_session(&root, &args.mode.to_string(), args.goal, args.budget)?;
+    println!("started session {}", state.session_id);
+    println!("session root: {}", dialec_dir(&root).display());
+    if should_drive {
+        drive(
+            &root,
+            DriveOptions {
+                max_rounds: None,
+                max_parallel: args.max_parallel,
+                phase: None,
+                no_cleanup: false,
+            },
+        )?;
+        println!("drive completed");
+    } else if should_spawn_coordinator {
+        let coordinator = spawn_coordinator(&root, args.foreground)?;
+        if args.foreground {
+            println!("coordinator completed");
+        } else {
+            println!("coordinator pid: {}", coordinator.pid);
+            println!("tail: dialec tail --coordinator --follow");
+        }
+    } else {
+        match args.mode {
+            Mode::Sidecar => {
+                println!(
+                    "sidecar skill: {}",
+                    dialec_dir(&root)
+                        .join("skills")
+                        .join("sidecar.md")
+                        .display()
+                );
+                println!(
+                    "next: use the live Claude session to call dialec run/spec/implement/cleanup, or run `dialec drive` when you want deterministic local autopilot"
+                );
+            }
+            Mode::Interactive => println!("next: dialec run or dialec drive"),
+            Mode::Autonomous => println!("next: dialec release or dialec drive"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_drive(root: PathBuf, args: DriveArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    drive(
+        &root,
+        DriveOptions {
+            max_rounds: args.max_rounds,
+            max_parallel: args.max_parallel,
+            phase: args.phase,
+            no_cleanup: args.no_cleanup,
+        },
+    )?;
+    println!("drive completed");
+    Ok(())
+}
+
+fn cmd_phase(root: PathBuf, phase: &str, args: PhaseArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    drive(
+        &root,
+        DriveOptions {
+            max_rounds: args.max_rounds,
+            max_parallel: args.max_parallel,
+            phase: Some(phase.to_string()),
+            no_cleanup: false,
+        },
+    )?;
+    println!("{phase} completed");
+    Ok(())
+}
+
+fn cmd_status(root: PathBuf, args: StatusArgs) -> Result<()> {
+    let state = read_state_refreshed(&root).with_context(|| {
+        format!(
+            "no Dialec session found at {}; run `dialec start`",
+            dialec_dir(&root).display()
+        )
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        println!("session: {}", state.session_id);
+        println!("mode: {}", state.mode);
+        println!("phase: {}", state.current_phase);
+        if let Some(goal) = state.goal {
+            println!("goal: {goal}");
+        }
+        println!("started: {}", state.started_at);
+        println!("turns: {}", state.total_turns);
+        println!(
+            "cost: ${:.4} / ${:.4}",
+            state.total_cost, state.budget.max_usd
+        );
+        if let Some(max_hours) = state.budget.max_hours {
+            println!("time budget: {max_hours:.2}h");
+        }
+        if let Some(max_turns) = state.budget.max_turns {
+            println!("turn budget: {max_turns}");
+        }
+        if let Some(coordinator) = state.coordinator {
+            println!(
+                "coordinator: pid={} status={} stdout={}",
+                coordinator.pid, coordinator.status, coordinator.stdout
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_log(root: PathBuf, args: LogArgs) -> Result<()> {
+    let log_path = dialec_dir(&root).join("log").join("timeline.jsonl");
+    let content = fs::read_to_string(&log_path)
+        .with_context(|| format!("failed to read {}", log_path.display()))?;
+    let mut rows: Vec<Value> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            args.phase.as_ref().is_none_or(|phase| {
+                value.get("phase").and_then(Value::as_str) == Some(phase.as_str())
+            })
+        })
+        .filter(|value| {
+            args.pod
+                .as_ref()
+                .is_none_or(|pod| value.get("pod").and_then(Value::as_str) == Some(pod.as_str()))
+        })
+        .collect();
+    if rows.len() > args.limit {
+        rows = rows.split_off(rows.len() - args.limit);
+    }
+    for row in rows {
+        println!("{}", serde_json::to_string(&row)?);
+    }
+    Ok(())
+}
+
+fn cmd_run(root: PathBuf, args: RunArgs) -> Result<()> {
+    ensure_layout(&root)?;
+    let workspace = match args.workspace {
+        Some(path) => fsutil::normalize(&path)?,
+        None => root.clone(),
+    };
+    let artifacts = args
+        .artifacts
+        .iter()
+        .map(|path| fsutil::normalize(path))
+        .collect::<Result<Vec<_>>>()?;
+    let req = RunRequest {
+        phase: args.phase,
+        role: args.role,
+        harness: args.harness,
+        task: args.task,
+        workspace,
+        project_root: root.clone(),
+        pod: args.pod,
+        sandbox: args.sandbox,
+        approval: args.approval,
+        timeout_ms: args.timeout_seconds * 1000,
+        artifacts,
+        max_budget_usd: load_or_default(&root)
+            .ok()
+            .map(|config| config.budget.per_turn_max_usd),
+        max_turns: read_state(&root)
+            .ok()
+            .and_then(|state| state.budget.max_turns),
+    };
+    let tx = run_transaction(req)?;
+    log_timeline(
+        &root,
+        json!({
+            "event": "turn-completed",
+            "transactionId": tx.id,
+            "phase": tx.phase,
+            "pod": tx.pod,
+            "role": tx.role,
+            "harness": tx.harness,
+            "verdict": tx.signal.verdict,
+            "exitCode": tx.exit_code,
+            "costUsd": tx.cost.as_ref().and_then(|record| record.usd),
+            "at": tx.completed_at
+        }),
+    )?;
+    log_cost(
+        &root,
+        json!({
+            "transactionId": tx.id,
+            "phase": tx.phase,
+            "pod": tx.pod,
+            "role": tx.role,
+            "harness": tx.harness,
+            "reportedCostUsd": tx.cost.as_ref().and_then(|record| record.usd),
+            "cost": tx.cost.clone(),
+            "at": tx.completed_at
+        }),
+    )?;
+    println!("turn: {}", tx.id);
+    println!("verdict: {}", tx.signal.verdict);
+    println!(
+        "transaction: {}",
+        dialec_dir(&root)
+            .join("session")
+            .join("turns")
+            .join(&tx.id)
+            .join("transaction.json")
+            .display()
+    );
+    if let Some(error) = tx.error {
+        anyhow::bail!("turn recorded with {} error: {}", error.kind, error.message);
+    }
+    Ok(())
+}
+
+fn cmd_worktree(root: PathBuf, command: WorktreeCommand) -> Result<()> {
+    ensure_layout(&root)?;
+    match command {
+        WorktreeCommand::Create(args) => {
+            let path = git::create_worktree(&root, &args.name, args.base.as_deref())?;
+            println!("{}", path.display());
+        }
+        WorktreeCommand::Remove(args) => {
+            git::remove_worktree(&root, &args.name, args.delete_branch)?;
+            println!("removed {}", args.name);
+        }
+        WorktreeCommand::List => {
+            print!("{}", git::list_worktrees(&root)?);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_advance(root: PathBuf, args: DecisionArgs) -> Result<()> {
+    let mut state = read_state(&root)?;
+    let phase = args.phase.unwrap_or_else(|| state.current_phase.clone());
+    let pod = args.pod.clone();
+    let reason = args.reason.clone();
+    let blockers = Ledger::read(&root)?.open_blocking(&phase, args.pod.as_deref());
+    let accepted: Vec<_> = blockers.iter().map(|entry| entry.id.clone()).collect();
+    for id in &accepted {
+        session::append_objections(
+            &root,
+            &[json!({
+                "event": "resolved",
+                "id": id,
+                "phase": phase,
+                "pod": pod.clone(),
+                "status": "user-accepted",
+                "reason": reason.clone(),
+                "at": Utc::now()
+            })],
+        )?;
+    }
+    state.current_phase = match phase.as_str() {
+        "spec" => "implement".to_string(),
+        "implement" => "cleanup".to_string(),
+        "cleanup" => "done".to_string(),
+        other => other.to_string(),
+    };
+    write_state(&root, &state)?;
+    log_decision(
+        &root,
+        json!({
+            "event": "force-advance",
+            "reason": reason.clone(),
+            "phase": phase,
+            "pod": pod.clone(),
+            "acceptedObjections": accepted,
+            "nextPhase": state.current_phase,
+            "at": Utc::now()
+        }),
+    )?;
+    println!("recorded force advance decision");
+    Ok(())
+}
+
+fn cmd_retry(root: PathBuf, args: RetryArgs) -> Result<()> {
+    log_decision(
+        &root,
+        json!({
+            "event": "force-retry",
+            "hint": args.hint,
+            "at": Utc::now()
+        }),
+    )?;
+    println!("recorded retry decision");
+    Ok(())
+}
+
+fn cmd_intervene(root: PathBuf) -> Result<()> {
+    let mut state = read_state(&root)?;
+    if let Some(mut coordinator) = state.coordinator.clone()
+        && coordinator.status == "running"
+    {
+        let status = ProcessCommand::new("kill")
+            .arg(coordinator.pid.to_string())
+            .status()
+            .with_context(|| format!("failed to kill coordinator pid {}", coordinator.pid))?;
+        coordinator.status = if status.success() {
+            "intervened".to_string()
+        } else {
+            "kill-failed".to_string()
+        };
+        state.coordinator = Some(coordinator);
+    }
+    state.mode = "sidecar".to_string();
+    write_state(&root, &state)?;
+    log_timeline(
+        &root,
+        json!({
+            "event": "intervened",
+            "mode": "sidecar",
+            "phase": state.current_phase,
+            "at": Utc::now()
+        }),
+    )?;
+    println!("mode: sidecar");
+    println!(
+        "sidecar skill: {}",
+        dialec_dir(&root)
+            .join("skills")
+            .join("sidecar.md")
+            .display()
+    );
+    Ok(())
+}
+
+fn cmd_release(root: PathBuf) -> Result<()> {
+    let mut state = read_state(&root)?;
+    state.mode = "autonomous".to_string();
+    write_state(&root, &state)?;
+    let coordinator = spawn_coordinator(&root, false)?;
+    log_timeline(
+        &root,
+        json!({
+            "event": "released",
+            "mode": "autonomous",
+            "phase": read_state(&root)?.current_phase,
+            "pid": coordinator.pid,
+            "at": Utc::now()
+        }),
+    )?;
+    println!("mode: autonomous");
+    println!("coordinator pid: {}", coordinator.pid);
+    println!("tail: dialec tail --coordinator --follow");
+    Ok(())
+}
+
+fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> {
+    ensure_layout(root)?;
+    let mut state = read_state(root)?;
+    let config = load_or_default(root)?;
+    let report = probe_harness("claude", root)?;
+    if !report.available {
+        anyhow::bail!("cannot spawn coordinator: claude harness is unavailable");
+    }
+    let program = report.command.unwrap_or_else(|| "claude".to_string());
+    let stdout_path = dialec_dir(root)
+        .join("log")
+        .join(format!("coordinator-{}.stdout.jsonl", state.session_id));
+    let stderr_path = dialec_dir(root)
+        .join("log")
+        .join(format!("coordinator-{}.stderr.log", state.session_id));
+    let prompt = coordinator_prompt(root, &state)?;
+    let role = dialec_dir(root).join("roles").join("coordinator.md");
+    let mut args = vec![
+        "-p".to_string(),
+        prompt,
+        "--bare".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--append-system-prompt-file".to_string(),
+        role.to_string_lossy().to_string(),
+        "--allowedTools".to_string(),
+        "Bash,Read,Glob,Grep,Edit,Write".to_string(),
+    ];
+    if config.budget.max_usd > 0.0 {
+        args.push("--max-budget-usd".to_string());
+        args.push(format!("{:.4}", config.budget.max_usd));
+    }
+    let stdout = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut child = ProcessCommand::new(&program)
+        .args(&args)
+        .current_dir(root)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("failed to spawn {program} coordinator"))?;
+    let pid = child.id();
+    let mut command = vec![program];
+    command.extend(args);
+    let mut coordinator = CoordinatorState {
+        pid,
+        started_at: Utc::now(),
+        stdout: fsutil::relative_to(&stdout_path, root),
+        stderr: fsutil::relative_to(&stderr_path, root),
+        command,
+        status: "running".to_string(),
+    };
+    state.mode = "autonomous".to_string();
+    state.coordinator = Some(coordinator.clone());
+    write_state(root, &state)?;
+    log_timeline(
+        root,
+        json!({
+            "event": "coordinator-started",
+            "pid": pid,
+            "stdout": coordinator.stdout,
+            "stderr": coordinator.stderr,
+            "foreground": foreground,
+            "at": Utc::now()
+        }),
+    )?;
+    if foreground {
+        let status = child
+            .wait()
+            .with_context(|| format!("failed to wait for coordinator pid {pid}"))?;
+        coordinator.status = if status.success() {
+            "completed".to_string()
+        } else {
+            format!("failed:{status}")
+        };
+        let mut state = read_state(root)?;
+        state.coordinator = Some(coordinator.clone());
+        write_state(root, &state)?;
+        log_timeline(
+            root,
+            json!({
+                "event": "coordinator-completed",
+                "pid": pid,
+                "status": coordinator.status,
+                "at": Utc::now()
+            }),
+        )?;
+    }
+    Ok(coordinator)
+}
+
+fn coordinator_prompt(root: &Path, state: &model::DialecState) -> Result<String> {
+    let goal = state
+        .goal
+        .clone()
+        .unwrap_or_else(|| "Continue the current Dialec session.".to_string());
+    Ok(format!(
+        "# Dialec Autonomous Session\n\nProject root: `{}`\nSession id: `{}`\nCurrent phase: `{}`\nGoal:\n{}\n\nStart by running `dialec status`. Drive the session to completion using Dialec commands. Prefer `dialec drive` for deterministic audited autopilot when it fits; otherwise use `dialec run`, `dialec worktree`, `dialec cron tick`, `dialec log`, `dialec advance`, and `dialec retry` according to the coordinator role prompt. Write `.dialec/session/final-report.md` when done.\n",
+        root.display(),
+        state.session_id,
+        state.current_phase,
+        goal
+    ))
+}
+
+fn cmd_tail(root: PathBuf, args: TailArgs) -> Result<()> {
+    let path = if args.coordinator {
+        let state = read_state(&root)?;
+        let coordinator = state
+            .coordinator
+            .context("no coordinator recorded in session state")?;
+        let rel = if args.stream == "stderr" {
+            coordinator.stderr
+        } else {
+            coordinator.stdout
+        };
+        root.join(rel)
+    } else if let Some(turn) = args.turn {
+        let file = match args.stream.as_str() {
+            "stderr" => "stderr.log",
+            "events" => "events.jsonl",
+            "final" => "final-message.md",
+            "transaction" => "transaction.json",
+            _ => "stdout.log",
+        };
+        dialec_dir(&root)
+            .join("session")
+            .join("turns")
+            .join(turn)
+            .join(file)
+    } else {
+        anyhow::bail!("provide --coordinator or --turn <id>");
+    };
+    tail_file(&path, args.follow)
+}
+
+fn tail_file(path: &Path, follow: bool) -> Result<()> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    print!("{content}");
+    if !follow {
+        return Ok(());
+    }
+    let mut pos = file.stream_position()?;
+    loop {
+        thread::sleep(Duration::from_millis(500));
+        let len = fs::metadata(path)?.len();
+        if len < pos {
+            pos = 0;
+        }
+        if len == pos {
+            continue;
+        }
+        file.seek(SeekFrom::Start(pos))?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        print!("{buf}");
+        pos = file.stream_position()?;
+    }
+}
+
+fn cmd_cron(root: PathBuf, command: CronCommand) -> Result<()> {
+    ensure_layout(&root)?;
+    match command {
+        CronCommand::Tick(args) => {
+            let text = session::reminder_text(&root, &args.role, &args.phase, args.pod.as_deref())?
+                .context("reminders are disabled")?;
+            let path = dialec_dir(&root)
+                .join("session")
+                .join("reminders")
+                .join(format!(
+                    "{}-{}-{}.md",
+                    Utc::now().format("%Y%m%dT%H%M%SZ"),
+                    session::sanitize(&args.phase),
+                    session::sanitize(&args.role)
+                ));
+            fs::write(&path, &text)?;
+            log_timeline(
+                &root,
+                json!({
+                    "event": "role-reminder-cron",
+                    "phase": args.phase,
+                    "pod": args.pod,
+                    "role": args.role,
+                    "path": path,
+                    "at": Utc::now()
+                }),
+            )?;
+            print!("{text}");
+        }
+        CronCommand::List => {
+            let config = load_or_default(&root)?;
+            println!("enabled: {}", config.reminders.enabled);
+            println!("everyTurn: {}", config.reminders.every_turns);
+            for rule in config.reminders.global_rules {
+                println!("global: {rule}");
+            }
+            for (role, rules) in config.reminders.role_rules {
+                for rule in rules {
+                    println!("{role}: {rule}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_workflow(root: PathBuf, command: WorkflowCommand) -> Result<()> {
+    ensure_layout(&root)?;
+    match command {
+        WorkflowCommand::List => {
+            let config = load_or_default(&root)?;
+            for name in config.workflows.keys() {
+                println!("{name}");
+            }
+            let workflows_dir = dialec_dir(&root).join("workflows");
+            if workflows_dir.exists() {
+                for entry in fs::read_dir(workflows_dir)? {
+                    let entry = entry?;
+                    if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                        && let Some(stem) = entry.path().file_stem().and_then(|stem| stem.to_str())
+                    {
+                        println!("{stem}");
+                    }
+                }
+            }
+        }
+        WorkflowCommand::Show(args) => {
+            let workflow = load_workflow(&root, &args.name)?;
+            println!("{}", serde_json::to_string_pretty(&workflow)?);
+        }
+        WorkflowCommand::Run(args) => {
+            let workflow = load_workflow(&root, &args.name)?;
+            run_custom_workflow(&root, &args.name, workflow, args.max_rounds)?;
+            println!("workflow completed: {}", args.name);
+        }
+    }
+    Ok(())
+}
+
+fn load_workflow(root: &Path, name: &str) -> Result<Workflow> {
+    let config = load_or_default(root)?;
+    if let Some(workflow) = config.workflows.get(name) {
+        return Ok(workflow.clone());
+    }
+    let path = dialec_dir(root)
+        .join("workflows")
+        .join(format!("{name}.json"));
+    fsutil::read_json(&path)
+}
+
+fn run_custom_workflow(
+    root: &Path,
+    name: &str,
+    workflow: Workflow,
+    max_rounds_override: Option<u32>,
+) -> Result<()> {
+    let config = load_or_default(root)?;
+    log_timeline(
+        root,
+        json!({"event": "workflow-started", "workflow": name, "at": Utc::now()}),
+    )?;
+    for phase in workflow.phases {
+        if phase.steps.is_empty() {
+            drive(
+                root,
+                DriveOptions {
+                    max_rounds: max_rounds_override.or(phase.max_rounds),
+                    max_parallel: 1,
+                    phase: Some(phase.name.clone()),
+                    no_cleanup: false,
+                },
+            )?;
+            continue;
+        }
+        let max_rounds = max_rounds_override
+            .or(phase.max_rounds)
+            .unwrap_or(config.convergence.max_rounds)
+            .max(1);
+        for round in 1..=max_rounds {
+            let mut latest = None;
+            for step in &phase.steps {
+                let harness = step
+                    .harness
+                    .clone()
+                    .or_else(|| config.roles.get(&step.role).cloned())
+                    .ok_or_else(|| anyhow::anyhow!("no harness mapping for role {}", step.role))?;
+                let workspace = match &step.workspace {
+                    Some(path) => fsutil::normalize(path)?,
+                    None => root.to_path_buf(),
+                };
+                let artifacts = step
+                    .artifacts
+                    .iter()
+                    .map(|path| fsutil::normalize(path))
+                    .collect::<Result<Vec<_>>>()?;
+                let tx = run_transaction(RunRequest {
+                    phase: phase.name.clone(),
+                    role: step.role.clone(),
+                    harness,
+                    task: format!(
+                        "{}\n\nWorkflow `{name}`, phase `{}`, round {round}.",
+                        step.task, phase.name
+                    ),
+                    workspace,
+                    project_root: root.to_path_buf(),
+                    pod: None,
+                    sandbox: step.sandbox.clone(),
+                    approval: step.approval.clone(),
+                    timeout_ms: 1_800_000,
+                    artifacts,
+                    max_budget_usd: Some(config.budget.per_turn_max_usd),
+                    max_turns: config.budget.max_turns,
+                })?;
+                log_timeline(
+                    root,
+                    json!({
+                        "event": "workflow-turn-completed",
+                        "workflow": name,
+                        "phase": phase.name,
+                        "round": round,
+                        "transactionId": tx.id,
+                        "role": tx.role,
+                        "verdict": tx.signal.verdict,
+                        "at": tx.completed_at
+                    }),
+                )?;
+                latest = Some(tx);
+            }
+            if !phase.repeat_until_converged {
+                break;
+            }
+            if let Some(tx) = latest
+                && signal_converged(&tx.signal)
+                && Ledger::read(root)?
+                    .open_blocking(&phase.name, None)
+                    .is_empty()
+            {
+                break;
+            }
+            if round == max_rounds {
+                anyhow::bail!("workflow `{name}` phase `{}` did not converge", phase.name);
+            }
+        }
+    }
+    log_timeline(
+        root,
+        json!({"event": "workflow-completed", "workflow": name, "at": Utc::now()}),
+    )?;
+    Ok(())
+}
+
+fn cmd_resume(root: PathBuf, args: ResumeArgs) -> Result<()> {
+    let state = read_state_refreshed(&root)?;
+    if let Some(session_id) = args.session_id
+        && session_id != state.session_id
+    {
+        anyhow::bail!(
+            "requested session {} but local session is {}",
+            session_id,
+            state.session_id
+        );
+    }
+    println!("resumed session {}", state.session_id);
+    println!("phase: {}", state.current_phase);
+    Ok(())
+}
+
+fn read_state_refreshed(root: &Path) -> Result<model::DialecState> {
+    let mut state = read_state(root)?;
+    if let Some(mut coordinator) = state.coordinator.clone()
+        && coordinator.status == "running"
+        && !pid_is_alive(coordinator.pid)
+    {
+        coordinator.status = "exited".to_string();
+        state.coordinator = Some(coordinator.clone());
+        write_state(root, &state)?;
+        log_timeline(
+            root,
+            json!({
+                "event": "coordinator-exited",
+                "pid": coordinator.pid,
+                "at": Utc::now()
+            }),
+        )?;
+    }
+    Ok(state)
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn print_harness_table(reports: &BTreeMap<String, HarnessCapabilities>) {
+    println!(
+        "{:<10} {:<10} {:<12} {:<24} command",
+        "harness", "available", "structured", "version"
+    );
+    for (name, report) in reports {
+        println!(
+            "{:<10} {:<10} {:<12} {:<24} {}",
+            name,
+            report.available,
+            report.structured_output.supported,
+            report.version.clone().unwrap_or_else(|| "-".to_string()),
+            report.command.clone().unwrap_or_else(|| "-".to_string())
+        );
+    }
+}
+
+fn validate_role_mappings(
+    root: &Path,
+    reports: &BTreeMap<String, HarnessCapabilities>,
+) -> Result<Vec<String>> {
+    let config = load_or_default(root)?;
+    let mut errors = vec![];
+    for (role, harness) in config.roles {
+        let Some(report) = reports.get(&harness) else {
+            errors.push(format!("role {role} maps to unknown harness {harness}"));
+            continue;
+        };
+        if !report.available {
+            errors.push(format!("role {role} maps to unavailable harness {harness}"));
+            continue;
+        }
+        if !report.headless {
+            errors.push(format!("role {role} harness {harness} lacks headless mode"));
+        }
+        if !report.structured_output.supported {
+            errors.push(format!(
+                "role {role} harness {harness} lacks structured output support"
+            ));
+        }
+        if matches!(role.as_str(), "implementer" | "refactorer") && report.cwd_flag.is_none() {
+            errors.push(format!(
+                "role {role} harness {harness} lacks workspace routing"
+            ));
+        }
+    }
+    Ok(errors)
+}
