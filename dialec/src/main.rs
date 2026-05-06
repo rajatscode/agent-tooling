@@ -854,9 +854,13 @@ fn cmd_retry(root: PathBuf, args: RetryArgs) -> Result<()> {
 
 fn cmd_intervene(root: PathBuf) -> Result<()> {
     let mut state = read_state(&root)?;
+    // Write stop file so watchdog doesn't restart
+    let stop_file = dialec_dir(&root).join("coordinator.stop");
+    fs::write(&stop_file, format!("intervened at {}\n", Utc::now()))?;
     if let Some(mut coordinator) = state.coordinator.clone()
         && coordinator.status == "running"
     {
+        // Kill the watchdog (which kills the coordinator subprocess tree)
         let status = ProcessCommand::new("kill")
             .arg(coordinator.pid.to_string())
             .status()
@@ -928,7 +932,11 @@ fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> 
         .join(format!("coordinator-{}.stderr.log", state.session_id));
     let prompt = coordinator_prompt(root, &state)?;
     let role = dialec_dir(root).join("roles").join("coordinator.md");
-    let mut args = vec![
+    let stop_file = dialec_dir(root).join("coordinator.stop");
+    // Remove stale stop file
+    let _ = fs::remove_file(&stop_file);
+
+    let mut claude_args = vec![
         "-p".to_string(),
         prompt,
         "--verbose".to_string(),
@@ -941,23 +949,82 @@ fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> 
         "Bash,Read,Glob,Grep,Edit,Write".to_string(),
     ];
     if config.budget.max_usd > 0.0 {
-        args.push("--max-budget-usd".to_string());
-        args.push(format!("{:.4}", config.budget.max_usd));
+        claude_args.push("--max-budget-usd".to_string());
+        claude_args.push(format!("{:.4}", config.budget.max_usd));
     }
-    let stdout = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let mut child = ProcessCommand::new(&program)
-        .args(&args)
+
+    // Build a watchdog script that restarts the coordinator on failure
+    let watchdog_path = dialec_dir(root).join("coordinator-watchdog.sh");
+    let mut watchdog = String::new();
+    watchdog.push_str("#!/bin/bash\n");
+    watchdog.push_str(&format!("cd '{}'\n", root.display()));
+    watchdog.push_str(&format!("STOP_FILE='{}'\n", stop_file.display()));
+    watchdog.push_str(&format!("STDOUT='{}'\n", stdout_path.display()));
+    watchdog.push_str(&format!("STDERR='{}'\n", stderr_path.display()));
+    watchdog.push_str("MAX_RESTARTS=10\n");
+    watchdog.push_str("RESTART_DELAY=30\n");
+    watchdog.push_str("RESTARTS=0\n\n");
+    watchdog.push_str("while true; do\n");
+    watchdog.push_str("  # Check stop conditions\n");
+    watchdog.push_str("  if [ -f \"$STOP_FILE\" ]; then\n");
+    watchdog.push_str("    echo \"[watchdog] stop file found, exiting\" >> \"$STDERR\"\n");
+    watchdog.push_str("    exit 0\n");
+    watchdog.push_str("  fi\n\n");
+    // Check deadline
+    if let Some(deadline) = config.budget.deadline {
+        watchdog.push_str(&format!(
+            "  if [ $(date -u +%s) -ge {} ]; then\n",
+            deadline.timestamp()
+        ));
+        watchdog.push_str("    echo \"[watchdog] deadline reached, exiting\" >> \"$STDERR\"\n");
+        watchdog.push_str("    exit 0\n");
+        watchdog.push_str("  fi\n\n");
+    }
+    watchdog.push_str("  # Run coordinator\n");
+    watchdog.push_str(&format!("  '{}' \\\n", program));
+    for arg in &claude_args {
+        let escaped = arg.replace('\'', "'\\''");
+        watchdog.push_str(&format!("    '{}' \\\n", escaped));
+    }
+    watchdog.push_str("    >> \"$STDOUT\" 2>> \"$STDERR\"\n");
+    watchdog.push_str("  EC=$?\n\n");
+    watchdog.push_str("  # Exit 0 = clean completion, don't restart\n");
+    watchdog.push_str("  if [ $EC -eq 0 ]; then\n");
+    watchdog.push_str("    echo \"[watchdog] coordinator exited cleanly\" >> \"$STDERR\"\n");
+    watchdog.push_str("    exit 0\n");
+    watchdog.push_str("  fi\n\n");
+    watchdog.push_str("  # Check stop file again after exit\n");
+    watchdog.push_str("  if [ -f \"$STOP_FILE\" ]; then\n");
+    watchdog.push_str("    echo \"[watchdog] stop file found after crash, exiting\" >> \"$STDERR\"\n");
+    watchdog.push_str("    exit 0\n");
+    watchdog.push_str("  fi\n\n");
+    watchdog.push_str("  RESTARTS=$((RESTARTS + 1))\n");
+    watchdog.push_str("  if [ $RESTARTS -ge $MAX_RESTARTS ]; then\n");
+    watchdog.push_str("    echo \"[watchdog] max restarts ($MAX_RESTARTS) reached, giving up\" >> \"$STDERR\"\n");
+    watchdog.push_str("    exit 1\n");
+    watchdog.push_str("  fi\n\n");
+    watchdog.push_str(&format!(
+        "  echo \"[watchdog] coordinator exited with $EC, restarting in ${{RESTART_DELAY}}s (attempt $RESTARTS/$MAX_RESTARTS)\" >> \"$STDERR\"\n"
+    ));
+    watchdog.push_str("  sleep $RESTART_DELAY\n");
+    watchdog.push_str("done\n");
+    fs::write(&watchdog_path, &watchdog)?;
+
+    ProcessCommand::new("chmod")
+        .args(["+x", &watchdog_path.to_string_lossy()])
+        .status()?;
+
+    let mut child = ProcessCommand::new("bash")
+        .arg(&watchdog_path)
         .current_dir(root)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("failed to spawn {program} coordinator"))?;
+        .with_context(|| "failed to spawn coordinator watchdog")?;
+
     let pid = child.id();
     let mut command = vec![program];
-    command.extend(args);
+    command.extend(claude_args);
     let mut coordinator = CoordinatorState {
         pid,
         started_at: Utc::now(),
@@ -974,6 +1041,9 @@ fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> 
         json!({
             "event": "coordinator-started",
             "pid": pid,
+            "watchdog": true,
+            "maxRestarts": 10,
+            "restartDelay": 30,
             "stdout": coordinator.stdout,
             "stderr": coordinator.stderr,
             "foreground": foreground,
@@ -983,7 +1053,7 @@ fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> 
     if foreground {
         let status = child
             .wait()
-            .with_context(|| format!("failed to wait for coordinator pid {pid}"))?;
+            .with_context(|| format!("failed to wait for coordinator watchdog pid {pid}"))?;
         coordinator.status = if status.success() {
             "completed".to_string()
         } else {
