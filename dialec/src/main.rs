@@ -152,6 +152,9 @@ struct TailArgs {
     follow: bool,
     #[arg(long, default_value = "stdout")]
     stream: String,
+    /// Output raw JSONL instead of pretty-printed
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1044,15 +1047,21 @@ fn cmd_tail(root: PathBuf, args: TailArgs) -> Result<()> {
     } else {
         anyhow::bail!("provide --coordinator or --turn <id>");
     };
-    tail_file(&path, args.follow)
+    tail_file(&path, args.follow, args.raw)
 }
 
-fn tail_file(path: &Path, follow: bool) -> Result<()> {
+fn tail_file(path: &Path, follow: bool, raw: bool) -> Result<()> {
     let mut file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    print!("{content}");
+    if raw {
+        print!("{content}");
+    } else {
+        for line in content.lines() {
+            pretty_print_event(line);
+        }
+    }
     if !follow {
         return Ok(());
     }
@@ -1069,8 +1078,117 @@ fn tail_file(path: &Path, follow: bool) -> Result<()> {
         file.seek(SeekFrom::Start(pos))?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
-        print!("{buf}");
+        if raw {
+            print!("{buf}");
+        } else {
+            for line in buf.lines() {
+                pretty_print_event(line);
+            }
+        }
         pos = file.stream_position()?;
+    }
+}
+
+fn pretty_print_event(line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        println!("{line}");
+        return;
+    };
+
+    let event_type = v.get("type").and_then(Value::as_str).unwrap_or("?");
+
+    match event_type {
+        "system" => {
+            let model = v.get("model").and_then(Value::as_str).unwrap_or("?");
+            let session = v.get("session_id").and_then(Value::as_str).unwrap_or("?");
+            let session_short = &session[..session.len().min(12)];
+            println!("\x1b[1;36m[init]\x1b[0m model=\x1b[1m{model}\x1b[0m session={session_short}...");
+        }
+        "assistant" => {
+            let content = v.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array);
+            if let Some(blocks) = content {
+                for block in blocks {
+                    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("?");
+                    match block_type {
+                        "thinking" => {
+                            let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                            let preview = &text[..text.len().min(200)];
+                            println!("\x1b[0;35m[thinking]\x1b[0m {preview}{}",
+                                if text.len() > 200 { "..." } else { "" });
+                        }
+                        "text" => {
+                            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                            if !text.is_empty() {
+                                println!("\x1b[1;37m[output]\x1b[0m {text}");
+                            }
+                        }
+                        "tool_use" => {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("?");
+                            let input = block.get("input").and_then(|i| {
+                                if let Some(cmd) = i.get("command").and_then(Value::as_str) {
+                                    Some(cmd.to_string())
+                                } else if let Some(pattern) = i.get("pattern").and_then(Value::as_str) {
+                                    Some(pattern.to_string())
+                                } else if let Some(path) = i.get("file_path").and_then(Value::as_str) {
+                                    Some(path.to_string())
+                                } else {
+                                    serde_json::to_string(i).ok()
+                                        .map(|s| if s.len() > 120 { format!("{}...", &s[..120]) } else { s })
+                                }
+                            }).unwrap_or_default();
+                            println!("\x1b[1;33m[tool]\x1b[0m \x1b[1m{name}\x1b[0m {input}");
+                        }
+                        "tool_result" => {
+                            let content_text = block.get("content").and_then(Value::as_str).unwrap_or("");
+                            let preview = &content_text[..content_text.len().min(200)];
+                            if !preview.is_empty() {
+                                println!("\x1b[0;33m[result]\x1b[0m {preview}{}",
+                                    if content_text.len() > 200 { "..." } else { "" });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Check for errors
+            if let Some(err) = v.get("error").and_then(Value::as_str) {
+                println!("\x1b[1;31m[error]\x1b[0m {err}");
+            }
+        }
+        "result" => {
+            let result = v.get("result").and_then(Value::as_str).unwrap_or("?");
+            let cost = v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+            let turns = v.get("num_turns").and_then(Value::as_u64).unwrap_or(0);
+            let duration = v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+            let preview = &result[..result.len().min(300)];
+            println!("\x1b[1;32m[done]\x1b[0m {preview}{}",
+                if result.len() > 300 { "..." } else { "" });
+            println!("\x1b[0;32m       cost=${cost:.4} turns={turns} duration={duration}ms\x1b[0m");
+        }
+        "rate_limit_event" => {
+            let limit_type = v.get("rate_limit_info")
+                .and_then(|r| r.get("rateLimitType"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let resets = v.get("rate_limit_info")
+                .and_then(|r| r.get("resetsAt"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!("\x1b[1;31m[rate-limit]\x1b[0m type={limit_type} resets_at={resets}");
+        }
+        _ => {
+            // Unknown event type — print compact
+            let compact = serde_json::to_string(&v).unwrap_or_else(|_| line.to_string());
+            let preview = &compact[..compact.len().min(150)];
+            println!("\x1b[0;90m[{event_type}]\x1b[0m {preview}{}",
+                if compact.len() > 150 { "..." } else { "" });
+        }
     }
 }
 
