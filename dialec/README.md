@@ -1,209 +1,187 @@
 # Dialec
 
-Rust CLI for the Dialec harness spec. It keeps implementation files under
-`dialec/`; runtime state for a target project goes in that project's
-`.dialec/` directory.
+Multi-harness orchestrator. Coordinates Claude, Codex, Gemini, and Cursor
+through structured phases (spec → implement → cleanup) with convergence,
+tmux panes, and inter-agent messaging.
 
-## Local Setup
+## Install
 
 ```bash
 cd dialec
-cargo build --release
 cargo install --path .
 ```
 
-After `cargo install --path .`, the executable is available as `dialec` from
-Cargo's bin directory, usually `~/.cargo/bin`.
-
-If you only want to run it from this checkout:
+Requires `claude` and `codex` CLIs installed and authenticated.
 
 ```bash
-cd dialec
-cargo run -- --help
+dialec check   # verify harnesses are available
 ```
 
-## First Use In A Project
+## Quick Start: Sidecar Mode (you + Claude + Codex)
 
-Run these from the project you want Dialec to operate on:
+You stay in your Claude Code session. Claude dispatches work to Codex (and
+other harnesses) via `dialec` and gets notified when children finish.
 
 ```bash
-dialec init
-dialec check
-dialec start --mode sidecar --goal "implement auth"
+# From your target project directory:
+dialec start --mode sidecar --goal "implement auth system"
+```
+
+Then in your Claude session, use the sidecar skill
+(`.dialec/skills/sidecar.md`) — Claude spawns children with `--pane`,
+starts background watchers, and continues working while children run.
+
+### The flow:
+
+1. You and Claude write a spec together
+2. Claude runs: `dialec run --pane --harness codex --role spec-reviewer ...`
+   → returns instantly, Codex reviews in a tmux pane
+3. Claude starts a background watcher on the turn
+4. When Codex finishes, the watcher notifies Claude
+5. Claude reads `dialec inbox coordinator` for Codex's verdict
+6. You iterate until convergence
+7. Claude dispatches implementation to Codex, verification stays with Claude
+8. Repeat through cleanup/refactor
+
+### Sending messages to children mid-session:
+
+```bash
+dialec send --to implementer "Focus on error handling, not just happy path"
+dialec send --to spec-reviewer --kind question "Are you checking token expiry?"
+dialec send --to implementer --ping "Check your inbox"   # also nudges the tmux pane
+dialec inbox coordinator   # read responses from children
+```
+
+## Quick Start: Autonomous Overnight Mode
+
+Claude drives end-to-end without you. Set a goal, set a budget, walk away.
+
+### Option A: Headless coordinator (Claude drives everything)
+
+```bash
+cd /path/to/your/project
+dialec start --mode autonomous --goal "implement the auth module per docs/auth-spec.md" --budget '$10'
+dialec tail --coordinator --follow   # watch it work (optional)
+```
+
+This spawns a headless Claude with the coordinator skill. It:
+- Writes a spec (or uses one you provide)
+- Sends it to Codex for adversarial review
+- Iterates until convergence
+- Creates worktrees, dispatches implementation pods to Codex
+- Verifies, meta-verifies, deslops each pod
+- Merges converged pods
+- Runs cleanup/refactor with adversarial review
+- Writes `.dialec/session/final-report.md` when done
+
+Review in the morning:
+```bash
 dialec status
+dialec log
+cat .dialec/session/final-report.md
 ```
 
-`sidecar` is the default. It creates `.dialec/`, writes the Claude Code
-sidecar skill at `.dialec/skills/sidecar.md`, and expects the live Claude
-session to coordinate with `dialec run`, `dialec spec`, `dialec implement`,
-and `dialec cleanup`.
-
-For headless execution:
+### Option B: Deterministic drive (no coordinator, dialec does it)
 
 ```bash
-dialec start --mode autonomous --goal "implement auth" --budget 4h
-dialec tail --coordinator --follow
+dialec start --mode sidecar --goal "implement auth" --no-drive
+# ... write your spec to .dialec/session/phase-spec/final.md ...
+dialec drive --max-parallel 4
 ```
 
-Autonomous mode spawns a headless Claude coordinator with
-`.dialec/roles/coordinator.md`; it records coordinator stdout/stderr under
-`.dialec/log/` and preserves all harness turns as normal transactions.
+`dialec drive` runs the phase machine directly in Rust — it calls
+harnesses sequentially per phase, checks convergence, and advances.
+No Claude coordinator involved. Stops at user-approval gates in
+sidecar mode. Pass `--mode autonomous` to skip gates.
 
-For deterministic local autopilot from your shell:
+### Switching modes mid-session:
 
 ```bash
-dialec start --mode sidecar --goal "implement auth" --drive
+# You're in sidecar, happy with the spec, want to go to bed:
+dialec release   # spawns autonomous coordinator to continue
+
+# You wake up, coordinator is stuck:
+dialec intervene   # kills coordinator, drops to sidecar mode
 ```
 
-In sidecar/interactive mode this still stops at user-approval gates. Use
-autonomous mode for headless gate decisions, or resume an existing session
-with:
+## Pane Mode
 
-```text
-dialec drive
-spec -> implement -> cleanup
-```
-
-Phase-by-phase:
+`--pane` runs harnesses in visible tmux panes. Non-blocking — returns
+immediately with `verdict: pending`.
 
 ```bash
-dialec spec
-dialec implement
-dialec cleanup
+# Spawn a child (returns instantly):
+dialec run --pane --harness codex --role implementer --phase implement \
+  --task "Implement auth" --artifact .dialec/session/phase-spec/final.md \
+  --sandbox workspace-write --timeout-seconds 300
+
+# Watch it work in the tmux pane
+# When it finishes, it auto-finalizes and notifies the coordinator channel
+
+# Check results:
+dialec inbox coordinator
 ```
 
-`dialec check` probes installed harnesses and writes capability reports to:
+Multiple children can run in parallel in separate panes.
 
-```text
-.dialec/capabilities/
-```
+## Inter-Agent Channels
 
-## Running A Turn
-
-Manual single-turn execution is still available for debugging. This invokes
-the selected native harness and may spend API/model budget:
+Agents communicate through file-based channels at
+`.dialec/channels/<role>/inbox.jsonl`.
 
 ```bash
-dialec run \
-  --harness codex \
-  --role implementer \
-  --phase implement \
-  --task "Implement the frozen spec in .dialec/session/phase-spec/final.md" \
-  --workspace . \
-  --artifact .dialec/session/phase-spec/final.md
+dialec send --to spec-reviewer "Be harsh on missing error variants"
+dialec send --to implementer --kind cancel "Stop, spec changed"
+dialec inbox coordinator   # messages FROM children
+dialec inbox implementer   # messages TO implementer
 ```
 
-Every run is recorded as an immutable transaction:
+Message kinds: `directive`, `question`, `update`, `cancel`, `nudge`.
 
-```text
-.dialec/session/turns/0001-codex-implementer/
-├── input.json
-├── command.json
-├── before.json
-├── reminder.md
-├── stdout.log
-├── stderr.log
-├── events.jsonl
-├── final-message.md
-├── structured.json
-├── signal.json
-├── after.json
-├── patch.diff
-└── transaction.json
+Messages are injected into agent prompts at turn start. The `--ping`
+flag also sends a tmux notification to the agent's pane.
+
+## Session Structure
+
+```
+.dialec/
+├── dialec.json           # session state
+├── config.json           # harness config, convergence params
+├── signal-schema.json    # convergence signal JSON Schema
+├── capabilities/         # probed harness reports
+├── roles/                # system prompts per role
+├── skills/               # Claude Code skills (sidecar.md, coordinator.md)
+├── channels/             # inter-agent message inboxes
+├── memory/               # persistent cross-session memory
+├── session/
+│   ├── objections.jsonl  # convergence ledger
+│   ├── turns/            # immutable transaction dirs
+│   ├── phase-spec/       # spec artifacts
+│   ├── phase-impl/       # impl pods + artifacts
+│   └── phase-cleanup/    # cleanup artifacts
+├── workspaces/           # git worktrees for pods
+└── log/                  # timeline, costs, decisions
 ```
 
-## Worktrees
+## All Commands
 
 ```bash
-dialec worktree create pod-auth
-dialec worktree list
-dialec worktree remove pod-auth --delete-branch
+dialec init                        # create .dialec/ layout
+dialec check                       # probe harnesses, validate roles
+dialec start [--mode] [--goal]     # start a session
+dialec status                      # current phase, cost, turns
+dialec drive [--max-parallel N]    # deterministic autopilot
+dialec spec / implement / cleanup  # run a single phase
+dialec run --pane --harness ...    # spawn a child in a tmux pane
+dialec finalize --turn <id>        # finalize a pane turn (called by pane script)
+dialec send --to <role> "msg"      # send message to agent
+dialec inbox <target>              # read channel messages
+dialec advance --reason "..."      # force past deadlock
+dialec retry --hint "..."          # retry with guidance
+dialec intervene                   # kill coordinator, drop to sidecar
+dialec release                     # spawn coordinator, go autonomous
+dialec tail --coordinator -f       # watch coordinator logs
+dialec worktree create/remove/list # manage workspaces
+dialec log [--phase] [--pod]       # view timeline
+dialec harnesses                   # list detected harnesses
 ```
-
-## Phase Runner
-
-```bash
-dialec drive                 # continue from current phase until done
-dialec spec                  # run only spec phase
-dialec implement --max-parallel 4
-dialec cleanup               # run only cleanup phase
-dialec advance --reason "ship this decision"
-dialec retry --hint "focus on the auth edge case"
-```
-
-The runner calls the transaction engine internally, checks convergence
-signals, updates `.dialec/session/objections.jsonl`, and advances phase
-state in `.dialec/dialec.json`.
-
-Implementation pods run concurrently when `--max-parallel` is greater than
-one. Each pod converges in its own Dialec-managed worktree; converged pod
-branches then enter an ordered merge queue so the main workspace is only
-written by one merge at a time. Timeline events include
-`parallel-pods-started`, `parallel-pods-converged`, `pod-merge-queued`, and
-`pod-integrated`.
-
-`drive` is intentionally explicit. It goes beyond the original "Dialec is
-mostly plumbing" model by acting as a deterministic local conductor, but it
-uses the same audited transaction, ledger, gate, and worktree machinery as
-sidecar and autonomous mode.
-
-## Role Reminder Crons
-
-Dialec injects role/rules reminders into every turn by default. Each reminder
-is written as `reminder.md` inside the transaction directory and logged as a
-`role-reminder` timeline event.
-
-```bash
-dialec cron list
-dialec cron tick --role project-manager --phase spec
-```
-
-Configure cadence and role rules in `.dialec/config.json` under
-`reminders`. Defaults include role boundaries such as PM/coordinator/reviewer
-roles not writing source code, implementers owning pod code changes, and
-verifier/adversary worktrees being disposable.
-
-## Transparency
-
-```bash
-dialec status --json
-dialec log --phase implement
-dialec tail --turn 0003-codex-implementer --stream events
-dialec tail --coordinator --stream stderr
-```
-
-Phase gates are recorded under `.dialec/session/gates/`. Merge conflicts and
-autonomous deadlocks write `.dialec/session/escalation.md`.
-
-Harness stdout is normalized into `events.jsonl` with categories such as
-`message`, `tool-call`, `tool-result`, `command`, `file-change`, `session`,
-and `cost`. Claude, Codex, Gemini, Cursor, and Claudish each have adapter-aware
-normalization with a generic fallback for unknown event shapes.
-
-When a harness reports a session id and capability probing confirms resume
-support, Dialec stores it in `.dialec/session/resume.json` and reuses it on the
-next compatible harness/role/phase/pod turn. Artifacts, memory, reminders, and
-the objection ledger are still replayed every time; resume is only a context
-cache.
-
-## Custom Workflows
-
-The built-in workflow is `spec -> implement -> cleanup`. Additional phase DAGs
-can be added as JSON files in `.dialec/workflows/<name>.json` or under
-`workflows` in `.dialec/config.json`.
-
-```bash
-dialec workflow list
-dialec workflow show default
-dialec workflow run default
-```
-
-## Notes
-
-- `dialec run` uses real harness CLIs: `claude`, `codex`, `gemini`,
-  `cursor-agent`, and optional `claudish`.
-- Codex `--json` is captured as JSONL events; Claude/Gemini/Cursor JSON output
-  is normalized into `events.jsonl` when parseable.
-- Cursor is resolved as `cursor-agent`, not a local `agent` helper.
-- Runtime `.dialec/` state belongs to the target project, not this source
-  directory.
