@@ -104,9 +104,26 @@ cat .dialec/session/final-report.md
 ```
 
 When `--until` is set, dialec enters **hackathon mode**: after completing
-all phases, it asks "what should we build next?" and loops back to the
-spec phase with a new goal. It keeps going until the deadline or the PM
-agent says there's nothing left to do.
+all phases, it consults the hackathon team about what to build next
+and loops back to the spec phase with a new goal. It keeps going until
+the deadline or the team says there's nothing left to do.
+
+### Hackathon Team
+
+In hackathon mode (when `--until` is set), a persistent team of
+specialists consults on what to build each cycle:
+
+| Role | Harness | Responsibility |
+|------|---------|---------------|
+| **PM** | Claude | Owns the roadmap. Proposes features, ranks by impact, synthesizes team input into the final goal. |
+| **Arch Lead** | Codex | Reviews proposals for technical feasibility. Flags architectural risks, dependency issues, scope underestimates. |
+| **QA** | Claude | Identifies testing gaps, fragile behavior, edge cases. Advocates for hardening work when the team is feature-biased. |
+| **Designer** | Claude | Proposes API/UX improvements, flags usability issues and naming inconsistencies. |
+| **Researcher** | Codex | Investigates unknowns — reads docs, source, git history. Surfaces prior art and blockers before the team commits. |
+
+Each cycle: PM proposes → team weighs in → PM synthesizes → goal is set
+→ spec/implement/cleanup → repeat. Planning artifacts are saved to
+`.dialec/session/hackathon-planning/<timestamp>/`.
 
 ### Stopping conditions
 

@@ -95,6 +95,12 @@ pub fn default_config() -> Config {
         ("refactorer", json!("claude")),
         ("adversary", json!("codex")),
         ("arbiter", json!("claude")),
+        // Hackathon persistent team
+        ("pm", json!("claude")),
+        ("arch-lead", json!("codex")),
+        ("qa", json!("claude")),
+        ("designer", json!("claude")),
+        ("researcher", json!("codex")),
     ])
     .into_iter()
     .map(|(k, v)| (k, v.as_str().unwrap().to_string()))
@@ -229,8 +235,34 @@ fn default_reminders() -> ReminderConfig {
             ])),
             ("pm", json!([
                 "PMs do not write code.",
-                "Clarify scope, decisions, acceptance criteria, and sequencing.",
-                "Dispatch implementation/refactor work to the correct implementation role."
+                "Own the roadmap and prioritization. Advocate for the user relentlessly.",
+                "Propose features with rationale, critique priorities, flag UX issues.",
+                "In hackathon mode: propose what to build next, synthesize team input into a final goal.",
+                "Produce ranked feature lists with scope estimates when asked to brainstorm."
+            ])),
+            ("arch-lead", json!([
+                "Architecture leads do not write code directly; they review and advise.",
+                "Assess technical feasibility of proposals. Flag architectural risks, dependency issues, and scope underestimates.",
+                "Recommend implementation approaches, module boundaries, and integration strategies.",
+                "Push back on proposals that would create tech debt or architectural inconsistency."
+            ])),
+            ("qa", json!([
+                "QA does not write production code; they identify testing gaps and quality risks.",
+                "Review test coverage, flag fragile behavior, suggest hardening work.",
+                "Identify edge cases, race conditions, and failure modes the implementation may miss.",
+                "Advocate for testing work when the team is biased toward features."
+            ])),
+            ("designer", json!([
+                "Designers do not write implementation code; they advise on UX and API design.",
+                "Propose API/interface improvements, flag usability issues and inconsistencies.",
+                "Advocate for developer experience: clear naming, intuitive defaults, good error messages.",
+                "Review proposals from the perspective of the person who will USE the code."
+            ])),
+            ("researcher", json!([
+                "Researchers investigate, read code, search docs, and gather context. They do not write production code.",
+                "For a given proposal, find existing libraries, patterns, prior art, and open issues.",
+                "Read relevant source files, TODOs, and git history to inform the team's decisions.",
+                "Surface unknowns and blockers before the team commits to a direction."
             ])),
         ])
         .into_iter()

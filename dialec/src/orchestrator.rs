@@ -1273,46 +1273,110 @@ fn update_memory(root: &Path, phase: &str, artifacts: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
-/// Ask a PM/planner agent what to work on next (hackathon mode).
+/// Hackathon team planning: consult persistent teammates to decide what to build next.
+///
+/// The team:
+/// - PM (claude): owns the roadmap, proposes features, advocates for the user
+/// - Arch Lead (codex): reviews proposals for technical feasibility, flags risks
+/// - QA (claude): identifies testing gaps, suggests hardening work
+/// - Designer (claude): proposes UX/API improvements, flags usability issues
+/// - Researcher (codex): investigates unknowns, reads docs/code, gathers context
+///
+/// Flow: PM proposes → team weighs in → PM synthesizes → final goal
 fn plan_next_work(root: &Path, config: &Config, pane: bool) -> Result<Option<String>> {
-    let pm_role = if config.roles.contains_key("pm") {
-        "pm"
-    } else {
-        "spec-writer" // fall back to spec-writer as planner
-    };
     let memory_dir = dialec_dir(root).join("memory");
     let decisions = memory_dir.join("decisions.md");
-    let tx = run_role(
-        root,
-        config,
-        RoleRun {
-            phase: "spec",
-            role: pm_role,
-            pod: None,
-            workspace: root,
-            task: "The previous goal has been completed. Review `.dialec/memory/decisions.md` and the current codebase. What is the highest-impact thing to build or improve next? Respond with a single clear goal statement in your convergence signal summary. If there is nothing meaningful left to do, approve with summary 'NO_MORE_WORK'.".to_string(),
-            artifacts: existing(vec![decisions]),
-            sandbox: "read-only",
-            approval: "never",
-            pane,
-        },
-    )?;
+    let planning_dir = dialec_dir(root).join("session").join("hackathon-planning");
+    ensure_dir(&planning_dir)?;
+    let round_id = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let round_dir = planning_dir.join(&round_id);
+    ensure_dir(&round_dir)?;
+
+    // Step 1: PM proposes what to build next
+    let pm_proposal = round_dir.join("pm-proposal.md");
+    let tx = run_role(root, config, RoleRun {
+        phase: "spec", role: "pm", pod: None, workspace: root,
+        task: format!(
+            "The previous goal has been completed. Review `.dialec/memory/decisions.md`, the codebase, and recent session history.\n\n\
+            Propose the top 3 highest-impact things to build or improve next. For each, give:\n\
+            1. One-line goal statement\n\
+            2. Why it matters (user value or technical necessity)\n\
+            3. Rough scope (small/medium/large)\n\n\
+            Write your proposals to `{}`.\n\n\
+            If there is genuinely nothing meaningful left to do, approve with summary 'NO_MORE_WORK'.",
+            pm_proposal.display()
+        ),
+        artifacts: existing(vec![decisions.clone()]),
+        sandbox: "read-only", approval: "never", pane,
+    })?;
+    promote_final_message(root, &tx, &pm_proposal)?;
+
     if tx.signal.verdict == "approve" && tx.signal.summary.contains("NO_MORE_WORK") {
-        log_timeline(
-            root,
-            json!({"event": "hackathon-no-more-work", "at": Utc::now()}),
-        )?;
+        log_timeline(root, json!({"event": "hackathon-no-more-work", "at": Utc::now()}))?;
         return Ok(None);
     }
-    log_timeline(
-        root,
-        json!({
-            "event": "hackathon-next-goal",
-            "goal": tx.signal.summary,
-            "at": Utc::now()
-        }),
-    )?;
-    Ok(Some(tx.signal.summary))
+
+    // Step 2: Team weighs in (parallel where possible, sequential for now)
+    let hackathon_roles: &[(&str, &str)] = &[
+        ("arch-lead", "Review the PM's proposals for technical feasibility. Flag architectural risks, dependency issues, or scope underestimates. Which proposal is most achievable given the current codebase? Write your assessment."),
+        ("qa", "Review the PM's proposals from a quality perspective. Which areas of the codebase have the weakest test coverage or most fragile behavior? Does any proposal address those gaps? What testing work is overdue? Write your assessment."),
+        ("designer", "Review the PM's proposals from a UX/API perspective. Are there usability issues, inconsistent interfaces, or missing affordances in the current codebase? Which proposal would most improve the developer experience? Write your assessment."),
+        ("researcher", "Review the PM's proposals. For the top proposal, investigate: are there existing libraries, patterns, or prior art we should know about? Are there open issues or TODOs in the codebase related to these proposals? Write your findings."),
+    ];
+
+    let mut team_inputs: Vec<PathBuf> = vec![pm_proposal.clone()];
+    for (role, task_template) in hackathon_roles {
+        // Skip roles that aren't configured
+        if !config.roles.contains_key(*role) {
+            continue;
+        }
+        let output_path = round_dir.join(format!("{role}-input.md"));
+        let tx = run_role(root, config, RoleRun {
+            phase: "spec", role, pod: None, workspace: root,
+            task: format!(
+                "{}\n\nThe PM's proposals are at `{}`. Write your assessment to `{}`.",
+                task_template, pm_proposal.display(), output_path.display()
+            ),
+            artifacts: existing(vec![pm_proposal.clone(), decisions.clone()]),
+            sandbox: "read-only", approval: "never", pane,
+        })?;
+        promote_final_message(root, &tx, &output_path)?;
+        team_inputs.push(output_path);
+    }
+
+    // Step 3: PM synthesizes team input into a final goal
+    let final_goal = round_dir.join("final-goal.md");
+    let tx = run_role(root, config, RoleRun {
+        phase: "spec", role: "pm", pod: None, workspace: root,
+        task: format!(
+            "Your team has weighed in on your proposals. Read all their assessments in `{}`.\n\n\
+            Synthesize their feedback into a single, specific goal statement. The arch-lead's feasibility \
+            assessment and the QA's coverage gaps should weigh heavily. The researcher's findings may \
+            reveal blockers or shortcuts.\n\n\
+            Respond with the final goal in your convergence signal summary. This will become the next \
+            spec/implement/cleanup cycle's goal.\n\n\
+            Write the full rationale to `{}`.",
+            round_dir.display(), final_goal.display()
+        ),
+        artifacts: team_inputs,
+        sandbox: "read-only", approval: "never", pane,
+    })?;
+    promote_final_message(root, &tx, &final_goal)?;
+
+    if tx.signal.verdict == "approve" && tx.signal.summary.contains("NO_MORE_WORK") {
+        log_timeline(root, json!({"event": "hackathon-no-more-work", "at": Utc::now()}))?;
+        return Ok(None);
+    }
+
+    let goal = tx.signal.summary;
+    log_timeline(root, json!({
+        "event": "hackathon-next-goal",
+        "goal": goal,
+        "planningRound": round_id,
+        "at": Utc::now()
+    }))?;
+    update_memory(root, "hackathon-planning", &[final_goal])?;
+    Ok(Some(goal))
 }
 
 /// Check if the stated goal has been achieved by asking a verifier.
