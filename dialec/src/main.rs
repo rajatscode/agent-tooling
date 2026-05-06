@@ -928,9 +928,10 @@ fn spawn_coordinator(root: &Path, foreground: bool) -> Result<CoordinatorState> 
     let mut args = vec![
         "-p".to_string(),
         prompt,
-        "--bare".to_string(),
+        "--verbose".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        "--dangerously-skip-permissions".to_string(),
         "--append-system-prompt-file".to_string(),
         role.to_string_lossy().to_string(),
         "--allowedTools".to_string(),
