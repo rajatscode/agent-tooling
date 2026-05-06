@@ -860,12 +860,26 @@ fn cmd_intervene(root: PathBuf) -> Result<()> {
     if let Some(mut coordinator) = state.coordinator.clone()
         && coordinator.status == "running"
     {
-        // Kill the watchdog (which kills the coordinator subprocess tree)
-        let status = ProcessCommand::new("kill")
+        // Kill the entire process group (watchdog + all children including Claude)
+        let _ = ProcessCommand::new("kill")
+            .args(["--", &format!("-{}", coordinator.pid)])
+            .status();
+        // Also kill by PID directly as fallback
+        let _ = ProcessCommand::new("kill")
             .arg(coordinator.pid.to_string())
+            .status();
+        // Find and kill any orphaned Claude processes for this session
+        let _ = ProcessCommand::new("pkill")
+            .args(["-f", &format!("dialec.*{}", state.session_id)])
+            .status();
+        let dead = ProcessCommand::new("kill")
+            .args(["-0", &coordinator.pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
-            .with_context(|| format!("failed to kill coordinator pid {}", coordinator.pid))?;
-        coordinator.status = if status.success() {
+            .map(|s| !s.success())  // kill -0 fails = process is dead = good
+            .unwrap_or(true);
+        coordinator.status = if dead {
             "intervened".to_string()
         } else {
             "kill-failed".to_string()
