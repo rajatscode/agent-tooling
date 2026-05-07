@@ -1,0 +1,41 @@
+{
+  "name": "claude",
+  "available": true,
+  "command": "/usr/local/bin/claude",
+  "version": "2.1.92 (Claude Code)",
+  "authed": true,
+  "cwdFlag": "cwd + --add-dir",
+  "headless": true,
+  "outputModes": [
+    "json",
+    "stream-json",
+    "text"
+  ],
+  "structuredOutput": {
+    "supported": true,
+    "mechanism": "json-schema flag",
+    "schemaFlag": "--json-schema"
+  },
+  "promptInjection": [
+    {
+      "mechanism": "system-prompt",
+      "flag": "--system-prompt",
+      "fileName": null,
+      "probed": true
+    }
+  ],
+  "sandboxModes": [],
+  "approvalModes": [
+    "default",
+    "dontAsk",
+    "bypassPermissions"
+  ],
+  "canResume": true,
+  "canReportCost": true,
+  "canStreamEvents": true,
+  "canEmitToolEvents": true,
+  "supportsExtraWritableRoots": true,
+  "limitations": [
+    "Claude exposes permission modes, not Codex-style sandbox modes."
+  ]
+}

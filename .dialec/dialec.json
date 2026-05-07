@@ -1,0 +1,30 @@
+{
+  "sessionId": "fd7b7b2d-5812-41de-a9b2-739e15d786b2",
+  "mode": "sidecar",
+  "startedAt": "2026-05-07T16:30:35.828795Z",
+  "currentPhase": "spec",
+  "goal": "Build a simple CLI todo app in Rust that stores todos in a JSON file with add, list, and delete commands",
+  "phases": {
+    "cleanup": {
+      "status": "pending"
+    },
+    "implement": {
+      "pods": {},
+      "status": "pending"
+    },
+    "spec": {
+      "cost": 0.0,
+      "rounds": 0,
+      "status": "in-progress"
+    }
+  },
+  "totalCost": 0.0,
+  "budget": {
+    "maxUsd": 10.0,
+    "perTurnMaxUsd": 2.0,
+    "perPhaseMaxUsd": null,
+    "maxHours": null,
+    "maxTurns": null
+  },
+  "totalTurns": 0
+}

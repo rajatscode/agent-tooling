@@ -1,0 +1,11 @@
+{"at":"2026-05-07T16:30:35.829386Z","event":"session-started","mode":"sidecar","phase":"spec","sessionId":"fd7b7b2d-5812-41de-a9b2-739e15d786b2"}
+{"at":"2026-05-07T16:31:14.805904Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-writer","transactionId":"spec-spec-writer-a2b4d68e","verdict":"approved"}
+{"at":"2026-05-07T17:06:05.527053Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-reviewer","transactionId":"spec-spec-reviewer-2778690d","verdict":"approved"}
+{"at":"2026-05-07T17:06:57.935800Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-writer","transactionId":"spec-spec-writer-9024dfac","verdict":"approved"}
+{"at":"2026-05-07T17:40:50.933105Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-reviewer","transactionId":"spec-spec-reviewer-226114c4","verdict":"approved"}
+{"at":"2026-05-07T17:41:44.332783Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-writer","transactionId":"spec-spec-writer-dd508136","verdict":"approved"}
+{"at":"2026-05-07T19:30:03.209807Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-reviewer","transactionId":"spec-spec-reviewer-584b79fe","verdict":"approved"}
+{"at":"2026-05-07T19:31:09.773976Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-writer","transactionId":"spec-spec-writer-3d1bdac5","verdict":"approved"}
+{"at":"2026-05-07T20:01:10.288006Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-reviewer","transactionId":"spec-spec-reviewer-96e8b313","verdict":"approved"}
+{"at":"2026-05-07T20:31:10.465858Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-writer","transactionId":"spec-spec-writer-20a120d1","verdict":"approved"}
+{"at":"2026-05-07T21:01:10.591777Z","event":"turn-completed","harness":"claude","phase":"spec","pod":null,"role":"spec-reviewer","transactionId":"spec-spec-reviewer-6b8c6f1c","verdict":"approved"}

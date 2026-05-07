@@ -1,0 +1,26 @@
+{
+  "name": "claudish",
+  "available": false,
+  "command": null,
+  "version": null,
+  "authed": null,
+  "cwdFlag": null,
+  "headless": false,
+  "outputModes": [],
+  "structuredOutput": {
+    "supported": false,
+    "mechanism": null,
+    "schemaFlag": null
+  },
+  "promptInjection": [],
+  "sandboxModes": [],
+  "approvalModes": [],
+  "canResume": false,
+  "canReportCost": false,
+  "canStreamEvents": false,
+  "canEmitToolEvents": false,
+  "supportsExtraWritableRoots": false,
+  "limitations": [
+    "none of these commands were found on PATH: claudish"
+  ]
+}

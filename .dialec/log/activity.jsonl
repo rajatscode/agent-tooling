@@ -1,0 +1,5 @@
+{"at":"2026-05-07T17:06:05.610893+00:00","blockers":0,"converged":false,"event":"convergence-check","phase":"spec","round":1}
+{"at":"2026-05-07T17:40:51.015983+00:00","blockers":0,"converged":false,"event":"convergence-check","phase":"spec","round":2}
+{"at":"2026-05-07T19:30:03.374765+00:00","blockers":0,"converged":false,"event":"convergence-check","phase":"spec","round":3}
+{"at":"2026-05-07T20:01:10.361208+00:00","blockers":0,"converged":false,"event":"convergence-check","phase":"spec","round":4}
+{"at":"2026-05-07T21:01:10.718385+00:00","blockers":0,"converged":false,"event":"convergence-check","phase":"spec","round":5}

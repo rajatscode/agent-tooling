@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "newObjectionIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "objections": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "blocking": {
+            "type": "boolean"
+          },
+          "category": {
+            "enum": [
+              "correctness",
+              "completeness",
+              "clarity",
+              "architecture",
+              "intent-mismatch",
+              "style",
+              "security",
+              "test-coverage",
+              "operability",
+              "performance"
+            ],
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposedResolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "enum": [
+              "blocker",
+              "major",
+              "minor",
+              "nit"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "open",
+              "addressed",
+              "withdrawn",
+              "user-accepted"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "category",
+          "severity",
+          "description",
+          "blocking",
+          "evidence",
+          "proposedResolution",
+          "location",
+          "owner",
+          "status"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "resolvedObjectionIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "approve",
+        "reject",
+        "approve-with-nits"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "summary",
+    "objections",
+    "resolvedObjectionIds",
+    "newObjectionIds"
+  ],
+  "type": "object"
+}

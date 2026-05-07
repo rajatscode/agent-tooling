@@ -1,0 +1,43 @@
+{
+  "name": "codex",
+  "available": true,
+  "command": "/usr/local/bin/codex",
+  "version": "codex-cli 0.46.0",
+  "authed": true,
+  "cwdFlag": "--cd",
+  "headless": true,
+  "outputModes": [
+    "jsonl"
+  ],
+  "structuredOutput": {
+    "supported": true,
+    "mechanism": "output-schema flag",
+    "schemaFlag": "--output-schema"
+  },
+  "promptInjection": [
+    {
+      "mechanism": "project-instructions-file",
+      "flag": null,
+      "fileName": "AGENTS.md",
+      "probed": false
+    }
+  ],
+  "sandboxModes": [
+    "read-only",
+    "workspace-write",
+    "danger-full-access"
+  ],
+  "approvalModes": [
+    "untrusted",
+    "on-request",
+    "never"
+  ],
+  "canResume": true,
+  "canReportCost": false,
+  "canStreamEvents": true,
+  "canEmitToolEvents": true,
+  "supportsExtraWritableRoots": false,
+  "limitations": [
+    "Codex --json emits event JSONL on stdout; -o writes only the last message."
+  ]
+}
