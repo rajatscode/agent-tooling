@@ -118,26 +118,23 @@ Write to {output_file} and exit when done."#,
     let session_id = Uuid::new_v4().to_string();
 
     // Spawn agent session in background with appropriate flags for each harness
-    let mut cmd = if harness == "codex" {
-        // codex requires a pseudo-TTY (isatty check), so wrap it with `script`
-        // `script` creates a pseudo-terminal and logs output to /dev/null
-        let mut script_cmd = Command::new("script");
-        script_cmd.arg("-q")
-            .arg("/dev/null")
-            .arg(harness);
-        script_cmd.arg(&prompt)
+    let mut cmd = Command::new(harness);
+    cmd.current_dir(workspace);
+
+    if harness == "codex" {
+        // codex: prompt is positional argument, use dangerously-bypass-approvals-and-sandbox
+        cmd.arg(&prompt)
             .arg("--dangerously-bypass-approvals-and-sandbox");
-        script_cmd.current_dir(workspace);
-        script_cmd
     } else {
         // claude: use -p flag for prompt, use dangerously-skip-permissions
-        let mut claude_cmd = Command::new(harness);
-        claude_cmd.arg("-p")
+        cmd.arg("-p")
             .arg(&prompt)
-            .arg("--dangerously-skip-permissions")
-            .current_dir(workspace);
-        claude_cmd
-    };
+            .arg("--dangerously-skip-permissions");
+    }
+
+    // For background execution, redirect stdin from /dev/null so agents don't block
+    // They don't read from stdin anyway - they just read files and write result.json
+    cmd.stdin(Stdio::null());
 
     let _child = cmd.spawn()
         .with_context(|| format!("failed to spawn {} session", harness))?;
