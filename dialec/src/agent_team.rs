@@ -118,50 +118,46 @@ Write to {output_file} and exit when done."#,
 
     let session_id = Uuid::new_v4().to_string();
 
-    // Use forkpty to allocate a PTY and fork a child process connected to it.
-    // This ensures the child has a real TTY, which satisfies codex's isatty() checks.
-    unsafe {
-        let mut master_fd: libc::c_int = 0;
-        let pid = libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+    // Write prompt to temp file to avoid shell escaping issues
+    let prompt_file = format!("/tmp/dialec_prompt_{}.txt", uuid::Uuid::new_v4());
+    fs::write(&prompt_file, &prompt)
+        .with_context(|| format!("failed to write prompt file {}", prompt_file))?;
 
-        if pid == -1 {
-            return Err(anyhow::anyhow!("forkpty failed"));
-        } else if pid == 0 {
-            // Child process: connected to PTY slave, spawn the agent
-            // Change to workspace directory
-            let _ = std::env::set_current_dir(workspace);
+    // Use 'script' command to allocate a real PTY, ensuring codex's isatty() checks pass.
+    // script -q /dev/null - run in quiet mode, output to /dev/null (we capture via result.json)
+    let shell_cmd = if harness == "codex" {
+        // codex: positional prompt argument, read from file
+        format!(
+            "cd '{}' && PROMPT=\"$(cat {})\" && script -q /dev/null {} \"$PROMPT\" --dangerously-bypass-approvals-and-sandbox",
+            workspace.display(),
+            prompt_file,
+            harness
+        )
+    } else {
+        // claude: -p flag for prompt, read from file
+        format!(
+            "cd '{}' && PROMPT=\"$(cat {})\" && script -q /dev/null {} -p \"$PROMPT\" --dangerously-skip-permissions",
+            workspace.display(),
+            prompt_file,
+            harness
+        )
+    };
 
-            let mut cmd = Command::new(harness);
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(&shell_cmd)
+        .stdin(Stdio::null());
 
-            if harness == "codex" {
-                // codex: prompt is positional argument, use dangerously-bypass-approvals-and-sandbox
-                cmd.arg(&prompt)
-                    .arg("--dangerously-bypass-approvals-and-sandbox");
-            } else {
-                // claude: use -p flag for prompt, use dangerously-skip-permissions
-                cmd.arg("-p")
-                    .arg(&prompt)
-                    .arg("--dangerously-skip-permissions");
-            }
+    let _child = cmd.spawn()
+        .with_context(|| format!("failed to spawn {} session via script PTY", harness))?;
 
-            // Spawn the agent. It inherits the PTY connection from forkpty.
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let _ = child.wait();
-                    std::process::exit(0);
-                }
-                Err(_) => {
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            // Parent process: child is running in background with PTY
-            // Close the master FD since we don't need it
-            libc::close(master_fd);
-            // Detach and return immediately
-            Ok(session_id)
-        }
-    }
+    // Clean up prompt file after a delay (fire and forget)
+    let _ = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(300));
+        let _ = fs::remove_file(&prompt_file);
+    });
+
+    Ok(session_id)
 }
 
 /// Task structure for the shared task list
