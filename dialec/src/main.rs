@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
-use transaction::run_transaction;
+use transaction::{run_transaction, run_transaction_async};
 
 #[derive(Debug, Parser)]
 #[command(name = "dialec")]
@@ -634,49 +634,18 @@ fn cmd_run(root: PathBuf, args: RunArgs) -> Result<()> {
             .and_then(|state| state.budget.max_turns),
         pane: args.pane,
     };
-    let tx = run_transaction(req)?;
-    log_timeline(
-        &root,
-        json!({
-            "event": "turn-completed",
-            "transactionId": tx.id,
-            "phase": tx.phase,
-            "pod": tx.pod,
-            "role": tx.role,
-            "harness": tx.harness,
-            "verdict": tx.signal.verdict,
-            "exitCode": tx.exit_code,
-            "costUsd": tx.cost.as_ref().and_then(|record| record.usd),
-            "at": tx.completed_at
-        }),
-    )?;
-    log_cost(
-        &root,
-        json!({
-            "transactionId": tx.id,
-            "phase": tx.phase,
-            "pod": tx.pod,
-            "role": tx.role,
-            "harness": tx.harness,
-            "reportedCostUsd": tx.cost.as_ref().and_then(|record| record.usd),
-            "cost": tx.cost.clone(),
-            "at": tx.completed_at
-        }),
-    )?;
-    println!("turn: {}", tx.id);
-    println!("verdict: {}", tx.signal.verdict);
+    let turn_id = run_transaction_async(req)?;
+    println!("turn: {}", turn_id);
     println!(
         "transaction: {}",
         dialec_dir(&root)
             .join("session")
             .join("turns")
-            .join(&tx.id)
+            .join(&turn_id)
             .join("transaction.json")
             .display()
     );
-    if let Some(error) = tx.error {
-        anyhow::bail!("turn recorded with {} error: {}", error.kind, error.message);
-    }
+    println!("status: pending (async execution)");
     Ok(())
 }
 

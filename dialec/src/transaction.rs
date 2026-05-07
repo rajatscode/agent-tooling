@@ -358,6 +358,22 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     Ok(transaction)
 }
 
+/// Spawn a turn async - returns the turn ID immediately after starting the harness in background.
+/// The harness will write transaction.json when done.
+pub fn run_transaction_async(req: RunRequest) -> Result<String> {
+    // Get the turn ID first (same directory setup as run_transaction)
+    let (turn_id, _) = crate::session::next_turn_dir(&req.project_root, &req.harness, &req.role)?;
+    let turn_id_clone = turn_id.clone();
+
+    // Spawn the actual transaction in a background thread
+    std::thread::spawn(move || {
+        let _ = run_transaction(req);
+    });
+
+    // Return immediately with the turn ID
+    Ok(turn_id_clone)
+}
+
 /// Finalize a pane-mode turn after the harness exits.
 /// Called by the pane script via `dialec finalize --turn <id>`.
 pub fn finalize_turn(root: &Path, turn_id: &str) -> Result<RunTransaction> {
