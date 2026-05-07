@@ -72,7 +72,7 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
     Ok(config)
 }
 
-/// Spawn a Claude Code session as a specific role to create an artifact.
+/// Spawn an agent (claude or codex) as a specific role to create an artifact.
 /// The agent writes its output to a file, and we poll for that file to detect completion.
 pub fn spawn_agent_for_artifact(
     role: &str,
@@ -80,6 +80,7 @@ pub fn spawn_agent_for_artifact(
     task_desc: &str,
     workspace: &Path,
     output_file: &Path,
+    harness: &str,
 ) -> Result<String> {
     let prompt = format!(
         r#"You are the {role} in a Dialec adversarial review phase.
@@ -116,14 +117,14 @@ Write to {output_file} and exit when done."#,
 
     let session_id = Uuid::new_v4().to_string();
 
-    // Spawn Claude Code session in background with -p (headless) mode
-    let _child = Command::new("claude")
+    // Spawn agent session in background with -p (headless) mode
+    let _child = Command::new(harness)
         .arg("-p")
         .arg(&prompt)
         .arg("--dangerously-skip-permissions")
         .current_dir(workspace)
         .spawn()
-        .context("failed to spawn Claude Code session")?;
+        .with_context(|| format!("failed to spawn {} session", harness))?;
 
     Ok(session_id)
 }

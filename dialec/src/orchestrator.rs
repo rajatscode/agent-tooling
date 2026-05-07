@@ -173,7 +173,13 @@ fn drive_spec(
             .unwrap_or_else(|_| "No goal provided.".to_string())
     });
 
-    for round in 1..=max_rounds {
+    // Loop until convergence, not just for max_rounds
+    let mut round = 1u32;
+    loop {
+        if round > max_rounds {
+            eprintln!("spec phase did not converge after {} rounds", max_rounds);
+            break;
+        }
         let draft = phase_dir.join(format!("draft-{round}.md"));
         if !draft.exists() {
             let tx = run_role(
@@ -267,6 +273,9 @@ fn drive_spec(
             commit_and_push(root, "dialec: spec phase converged");
             return Ok(());
         }
+
+        // Not converged, increment round and loop
+        round += 1;
     }
 
     if config.convergence.use_arbiter
@@ -484,7 +493,13 @@ fn drive_pod(
     let impl_worktree = git::create_worktree(root, &impl_name, None)?;
     let impl_branch = format!("dialec/{impl_name}");
 
-    for round in 1..=max_rounds {
+    // Loop until convergence, not just for max_rounds
+    let mut round = 1u32;
+    loop {
+        if round > max_rounds {
+            eprintln!("pod {} did not converge after {} rounds", pod.name, max_rounds);
+            break;
+        }
         let status = pod_dir
             .join("impl")
             .join(format!("round-{round}-status.md"));
@@ -524,7 +539,7 @@ fn drive_pod(
             config,
             RoleRun {
                 phase: "implement",
-                role: "verifier",
+                role: "impl-reviewer",
                 pod: Some(&pod.name),
                 workspace: &verify_worktree,
                 task: format!(
@@ -553,21 +568,22 @@ fn drive_pod(
             "round": round,
         })));
 
-        if !converged || !blockers.is_empty() {
-            continue;
+        if converged && blockers.is_empty() {
+            if drive_post_impl_reviews(root, config, pod, spec, &impl_worktree, &pod_dir, round, pane)? {
+                log_timeline(
+                    root,
+                    json!({"event": "pod-converged", "phase": "implement", "pod": pod.name, "branch": impl_branch, "round": round, "at": Utc::now()}),
+                )?;
+                return Ok(PodResult {
+                    name: pod.name.clone(),
+                    branch: impl_branch,
+                    worktree_name: impl_name,
+                });
+            }
         }
 
-        if drive_post_impl_reviews(root, config, pod, spec, &impl_worktree, &pod_dir, round, pane)? {
-            log_timeline(
-                root,
-                json!({"event": "pod-converged", "phase": "implement", "pod": pod.name, "branch": impl_branch, "round": round, "at": Utc::now()}),
-            )?;
-            return Ok(PodResult {
-                name: pod.name.clone(),
-                branch: impl_branch,
-                worktree_name: impl_name,
-            });
-        }
+        // Not converged, increment round and loop
+        round += 1;
     }
 
     if config.convergence.use_arbiter
@@ -905,14 +921,28 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
     let state = read_state(root)?;
     let turn_id = format!("{}-{}-{}", run.phase, run.role, Uuid::new_v4().to_string()[..8].to_string());
 
+    // Determine harness based on phase and role
+    let harness = match (run.phase, run.role) {
+        // Spec: claude writes, codex reviews
+        ("spec", "spec-writer") => "claude",
+        ("spec", "spec-reviewer") => "codex",
+        // Implement: codex writes, claude reviews
+        ("implement", "implementer") => "codex",
+        ("implement", "impl-reviewer") => "claude",
+        // Cleanup: claude writes, codex reviews
+        ("cleanup", "refactorer") => "claude",
+        ("cleanup", "refactor-reviewer") => "codex",
+        _ => "claude", // fallback
+    };
+
     // Create output directory for this turn
     let turn_dir = dialec_dir(root).join("session").join("turns").join(&turn_id);
     ensure_dir(&turn_dir)?;
     let output_file = turn_dir.join("result.json");
 
     eprintln!(
-        "Running {} in phase {} (turn: {})",
-        run.role, run.phase, turn_id
+        "Running {} in phase {} [harness: {}] (turn: {})",
+        run.role, run.phase, harness, turn_id
     );
 
     // Spawn agent to write output file
@@ -922,9 +952,10 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         &run.task,
         run.workspace,
         &output_file,
+        harness,
     ).context("failed to spawn agent")?;
 
-    eprintln!("Spawned Claude Code session for {}", run.role);
+    eprintln!("Spawned {} session for {}", harness, run.role);
 
     // Poll for agent output (timeout 30 minutes for complex work like implementation)
     let result = agent_team::poll_agent_output(&output_file, 1800)
@@ -950,13 +981,13 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         phase: run.phase.to_string(),
         pod: None,
         role: run.role.to_string(),
-        harness: "claude".to_string(),
+        harness: harness.to_string(),
         harness_version: Some("agent-file".to_string()),
         workspace: run.workspace.to_string_lossy().to_string(),
         started_at: now,
         completed_at: now,
         command: crate::model::CommandInvocation {
-            argv: vec!["claude".to_string(), "-p".to_string(), "agent".to_string()],
+            argv: vec![harness.to_string(), "-p".to_string(), "agent".to_string()],
             cwd: run.workspace.to_string_lossy().to_string(),
             timeout_ms: 1_800_000,
             env_allowlist: std::collections::BTreeMap::new(),
