@@ -361,13 +361,18 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
 /// Spawn a turn async - returns the turn ID immediately after starting the harness in background.
 /// The harness will write transaction.json when done.
 pub fn run_transaction_async(req: RunRequest) -> Result<String> {
-    // Get the turn ID first (same directory setup as run_transaction)
-    let (turn_id, _) = crate::session::next_turn_dir(&req.project_root, &req.harness, &req.role)?;
+    // Pre-allocate the turn ID by calling next_turn_dir
+    let (turn_id, turn_dir) = crate::session::next_turn_dir(&req.project_root, &req.harness, &req.role)?;
     let turn_id_clone = turn_id.clone();
 
     // Spawn the actual transaction in a background thread
+    // Important: the turn directory already exists, so run_transaction must not call next_turn_dir
+    // Instead, we need to modify how we handle the turn directory
     std::thread::spawn(move || {
-        let _ = run_transaction(req);
+        if let Err(e) = run_transaction(req) {
+            let error_log = turn_dir.join("error.log");
+            let _ = fs::write(&error_log, format!("async run error: {}\n{:?}", e, e));
+        }
     });
 
     // Return immediately with the turn ID
@@ -675,6 +680,7 @@ fn run_external(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_remove("CLAUDECODE")
         .spawn()
         .with_context(|| format!("failed to spawn {program}"))?;
 
