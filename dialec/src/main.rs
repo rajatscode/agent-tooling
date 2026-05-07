@@ -1,4 +1,5 @@
 mod activity;
+mod agent_team;
 mod capabilities;
 mod channel;
 mod config;

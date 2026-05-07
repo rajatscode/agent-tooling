@@ -1,3 +1,4 @@
+use crate::agent_team;
 use crate::config::load_or_default;
 use crate::fsutil::{dialec_dir, ensure_dir, write_json_pretty};
 use crate::git;
@@ -56,6 +57,16 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
         configured_rounds
     };
     let pane = options.pane;
+
+    // Enable Agent Teams for this session
+    unsafe {
+        std::env::set_var("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
+    }
+
+    // Create Agent Team for orchestration
+    let team = agent_team::create_team(root, &state.session_id)
+        .context("failed to create Agent Team")?;
+    eprintln!("Created Agent Team: {}", team.team_name);
     if options.max_parallel > 1 {
         log_decision(
             root,
@@ -890,31 +901,78 @@ struct RoleRun<'a> {
 }
 
 fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransaction> {
-    let harness = config
-        .roles
-        .get(run.role)
-        .ok_or_else(|| anyhow!("role {} has no harness mapping", run.role))?;
+    // Get the team name from the session state
+    let state = read_state(root)?;
+    let team_name = format!("dialec-{}", &state.session_id[..8]);
 
-    // Spawn harness async
-    let turn_id = run_transaction_async(RunRequest {
-        phase: run.phase.to_string(),
-        role: run.role.to_string(),
-        harness: harness.clone(),
-        task: run.task,
-        workspace: run.workspace.to_path_buf(),
-        project_root: root.to_path_buf(),
-        pod: run.pod.map(str::to_string),
-        sandbox: run.sandbox.to_string(),
-        approval: run.approval.to_string(),
-        timeout_ms: 1_800_000,
-        artifacts: run.artifacts,
-        max_budget_usd: Some(config.budget.per_turn_max_usd),
-        max_turns: config.budget.max_turns,
-        pane: run.pane,
-    })?;
+    // Create a task in the Agent Team's task list
+    let task_id = agent_team::create_task(
+        &team_name,
+        run.role,
+        run.phase,
+        &run.task,
+    ).context("failed to create Agent Team task")?;
 
-    // Poll for completion
-    let tx = poll_for_turn(root, &turn_id, 1800)?;
+    eprintln!(
+        "Created task {} for role {} in phase {}",
+        task_id, run.role, run.phase
+    );
+
+    // Spawn a Claude Code session that will join the team and work on the task
+    // The session reads its task from the shared task list and updates it when done
+    let team_join_prompt = format!(
+        r#"You are joining an Agent Team to act as the "{role}" in the "{phase}" phase.
+
+Team name: {team_name}
+Task ID: {task_id}
+Workspace: {workspace}
+
+Your task is defined in the shared task list. Work in the specified workspace and update the task with your results.
+
+Process:
+1. Read your task from ~/.claude/tasks/{team_name}/{task_id}.json
+2. Do the work specified in the task description
+3. Write results to the workspace as needed
+4. Update the task status to "completed" and include your verdict
+5. End by outputting a structured convergence signal with:
+   - verdict: "approved" or "rejected"
+   - summary: brief summary of your work
+   - objections: any blocking issues
+
+Work autonomously until the task is complete. The team orchestrator will detect your completion."#,
+        role = run.role,
+        phase = run.phase,
+        team_name = team_name,
+        task_id = task_id,
+        workspace = run.workspace.display()
+    );
+
+    agent_team::spawn_teammate(
+        &team_name,
+        run.role,
+        run.phase,
+        &run.task,
+        run.workspace,
+    ).context("failed to spawn Agent Team teammate")?;
+
+    eprintln!("Spawned Claude Code session for {}", run.role);
+
+    // Poll the task list for completion
+    let result = agent_team::poll_task_completion(&team_name, &task_id, 1800)
+        .context("failed waiting for task completion")?;
+
+    eprintln!("Task {} completed with verdict: {}", task_id, result.verdict);
+
+    // Convert task result to RunTransaction for compatibility
+    let tx = agent_team::task_result_to_transaction(
+        root,
+        &task_id,
+        run.role,
+        run.phase,
+        run.workspace,
+        &result,
+    )?;
+
     log_timeline(
         root,
         json!({
@@ -925,23 +983,10 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
             "role": tx.role,
             "harness": tx.harness,
             "verdict": tx.signal.verdict,
-            "exitCode": tx.exit_code,
             "at": tx.completed_at
         }),
     )?;
-    log_cost(
-        root,
-        json!({
-            "transactionId": tx.id,
-            "phase": tx.phase,
-            "pod": tx.pod,
-            "role": tx.role,
-            "harness": tx.harness,
-            "reportedCostUsd": tx.cost.as_ref().and_then(|record| record.usd),
-            "cost": tx.cost.clone(),
-            "at": tx.completed_at
-        }),
-    )?;
+
     Ok(tx)
 }
 
