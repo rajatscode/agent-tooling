@@ -39,6 +39,7 @@ pub fn ensure_layout(root: &Path) -> Result<()> {
     write_default_skills(root, false)?;
     write_memory_files(root)?;
     ensure_empty_file(&dialec.join("session").join("objections.jsonl"))?;
+    ensure_empty_file(&dialec.join("log").join("activity.jsonl"))?;
     ensure_empty_file(&dialec.join("log").join("timeline.jsonl"))?;
     ensure_empty_file(&dialec.join("log").join("decisions.jsonl"))?;
     ensure_empty_file(&dialec.join("log").join("costs.jsonl"))?;
@@ -122,6 +123,27 @@ pub fn write_state(root: &Path, state: &DialecState) -> Result<()> {
         }
     }
     write_json_pretty(&path, &next)
+}
+
+pub fn log_activity(root: &Path, event: &str, details: Option<Value>) -> Result<()> {
+    let _lock = acquire_lock(root, "activity-log")?;
+    let mut entry = json!({
+        "at": Utc::now().to_rfc3339(),
+        "event": event,
+    });
+    if let Some(details) = details {
+        if let Some(obj) = entry.as_object_mut() {
+            if let Some(detail_obj) = details.as_object() {
+                for (k, v) in detail_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    append_line(
+        &dialec_dir(root).join("log").join("activity.jsonl"),
+        &serde_json::to_string(&entry)?,
+    )
 }
 
 pub fn log_timeline(root: &Path, value: Value) -> Result<()> {

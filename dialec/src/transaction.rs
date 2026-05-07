@@ -9,7 +9,7 @@ use crate::model::{
 };
 use crate::schema::{extract_json, fallback_reject_signal, parse_signal};
 use crate::session::{
-    append_objections, enforce_budget, log_timeline, next_turn_dir, record_turn_cost,
+    append_objections, enforce_budget, log_activity, log_timeline, next_turn_dir, record_turn_cost,
     reminder_text, role_path, should_emit_reminder, signal_schema_path,
 };
 use anyhow::{Context, Result};
@@ -26,6 +26,19 @@ use std::time::{Duration, Instant};
 pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     ensure_dir(&dialec_dir(&req.project_root))?;
     enforce_budget(&req.project_root, Some(&req.phase))?;
+
+    let (turn_id, turn_dir) = next_turn_dir(&req.project_root, &req.harness, &req.role)?;
+    let started_at = Utc::now();
+
+    // Log turn start
+    let _ = log_activity(&req.project_root, "turn-start", Some(json!({
+        "turn_id": turn_id,
+        "phase": req.phase,
+        "role": req.role,
+        "harness": req.harness,
+        "pod": req.pod,
+    })));
+
     let capabilities = probe_harness(&req.harness, &req.project_root)?;
     if !capabilities.available {
         anyhow::bail!(
@@ -35,8 +48,13 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
         );
     }
 
-    let (turn_id, turn_dir) = next_turn_dir(&req.project_root, &req.harness, &req.role)?;
-    let started_at = Utc::now();
+    // Log harness probe
+    let _ = log_activity(&req.project_root, "probe-harness", Some(json!({
+        "turn_id": turn_id,
+        "harness": req.harness,
+        "available": capabilities.available,
+        "version": capabilities.version,
+    })));
     let role_file = role_path(&req.project_root, &req.role);
     let schema_file = signal_schema_path(&req.project_root);
     let final_message_path = turn_dir.join("final-message.md");
@@ -69,6 +87,16 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     };
     let task = compose_task(&req, &role_file, reminder_artifact.as_deref())?;
     let before = snapshot(&req.workspace);
+
+    // Log workspace snapshot
+    let _ = log_activity(&req.project_root, "workspace-snapshot", Some(json!({
+        "turn_id": turn_id,
+        "before": {
+            "branch": before.branch,
+            "head": before.head,
+            "dirty": before.dirty,
+        }
+    })));
 
     let (mut program, args, cwd) = build_command(
         &req,
@@ -171,6 +199,12 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     fs::write(turn_dir.join("stdout.log"), &output.stdout)?;
     fs::write(turn_dir.join("stderr.log"), &output.stderr)?;
 
+    // Log agent complete
+    let _ = log_activity(&req.project_root, "agent-complete", Some(json!({
+        "turn_id": turn_id,
+        "exit_code": output.exit_code,
+    })));
+
     let events_path = turn_dir.join("events.jsonl");
     if let Some(events) = normalize_events(&req.harness, &output.stdout) {
         fs::write(&events_path, events)?;
@@ -181,6 +215,14 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
     }
 
     let final_message = fs::read_to_string(&final_message_path).unwrap_or_default();
+
+    // Log agent output
+    let _ = log_activity(&req.project_root, "agent-output", Some(json!({
+        "turn_id": turn_id,
+        "agent": req.harness,
+        "stdout_lines": output.stdout.len(),
+        "stderr_lines": output.stderr.len(),
+    })));
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     let structured_value = extract_signal_from_text(&final_message)
         .or_else(|| extract_last_jsonl_message(&stdout_text))
@@ -216,6 +258,13 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
 
     write_json_pretty(&turn_dir.join("structured.json"), &structured_value)?;
     write_json_pretty(&turn_dir.join("signal.json"), &signal)?;
+
+    // Log signal parsed
+    let _ = log_activity(&req.project_root, "signal-parsed", Some(json!({
+        "turn_id": turn_id,
+        "verdict": signal.verdict,
+        "objections_count": signal.objections.len(),
+    })));
 
     let after = snapshot(&req.workspace);
     write_json_pretty(&turn_dir.join("after.json"), &after)?;
@@ -292,6 +341,19 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
         &req.project_root,
         cost.as_ref().and_then(|record| record.usd),
     )?;
+
+    // Log completion
+    let _ = log_activity(&req.project_root, "agent-complete", Some(json!({
+        "turn_id": transaction.id,
+        "exit_code": transaction.exit_code,
+    })));
+
+    // Log signal
+    let _ = log_activity(&req.project_root, "signal-parsed", Some(json!({
+        "turn_id": transaction.id,
+        "verdict": transaction.signal.verdict,
+        "objections_count": transaction.signal.objections.len(),
+    })));
 
     Ok(transaction)
 }

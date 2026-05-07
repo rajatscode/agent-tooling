@@ -148,6 +148,8 @@ struct TailArgs {
     turn: Option<String>,
     #[arg(long)]
     coordinator: bool,
+    #[arg(long)]
+    activity: bool,
     #[arg(short, long)]
     follow: bool,
     #[arg(long, default_value = "stdout")]
@@ -1104,7 +1106,9 @@ fn coordinator_prompt(root: &Path, state: &model::DialecState) -> Result<String>
 }
 
 fn cmd_tail(root: PathBuf, args: TailArgs) -> Result<()> {
-    let path = if args.coordinator {
+    let path = if args.activity {
+        dialec_dir(&root).join("log").join("activity.jsonl")
+    } else if args.coordinator {
         let state = read_state(&root)?;
         let coordinator = state
             .coordinator
@@ -1129,7 +1133,7 @@ fn cmd_tail(root: PathBuf, args: TailArgs) -> Result<()> {
             .join(turn)
             .join(file)
     } else {
-        anyhow::bail!("provide --coordinator or --turn <id>");
+        anyhow::bail!("provide --activity, --coordinator, or --turn <id>");
     };
     tail_file(&path, args.follow, args.raw)
 }
@@ -1183,9 +1187,84 @@ fn pretty_print_event(line: &str) {
         return;
     };
 
-    let event_type = v.get("type").and_then(Value::as_str).unwrap_or("?");
+    // Activity log events use "event" field, coordinator uses "type"
+    let event_type = v.get("event")
+        .or_else(|| v.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+
+    let at = v.get("at").and_then(Value::as_str).unwrap_or("");
+
+    // Format timestamp short
+    let time_short = if let Some(ts) = at.split('T').nth(1) {
+        ts.split('+').next().unwrap_or("?")
+    } else {
+        "?"
+    };
 
     match event_type {
+        "turn-start" => {
+            let turn_id = v.get("turn_id").and_then(Value::as_str).unwrap_or("?");
+            let phase = v.get("phase").and_then(Value::as_str).unwrap_or("?");
+            let role = v.get("role").and_then(Value::as_str).unwrap_or("?");
+            let harness = v.get("harness").and_then(Value::as_str).unwrap_or("?");
+            println!("\x1b[1;36m[{time_short}]\x1b[0m \x1b[1;37mTURN START\x1b[0m {turn_id} phase={phase} role={role} harness={harness}");
+        }
+        "probe-harness" => {
+            let harness = v.get("harness").and_then(Value::as_str).unwrap_or("?");
+            let available = v.get("available").and_then(Value::as_bool).unwrap_or(false);
+            let status = if available { "\x1b[1;32m✓\x1b[0m" } else { "\x1b[1;31m✗\x1b[0m" };
+            println!("\x1b[1;36m[{time_short}]\x1b[0m {status} probe harness={harness}");
+        }
+        "workspace-snapshot" => {
+            let branch = v.get("before")
+                .and_then(|b| b.get("branch"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let dirty = v.get("before")
+                .and_then(|b| b.get("dirty"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let dirty_marker = if dirty { " \x1b[1;33m[dirty]\x1b[0m" } else { "" };
+            println!("\x1b[1;36m[{time_short}]\x1b[0m workspace snapshot branch={branch}{dirty_marker}");
+        }
+        "agent-output" => {
+            let turn_id = v.get("turn_id").and_then(Value::as_str).unwrap_or("?");
+            let agent = v.get("agent").and_then(Value::as_str).unwrap_or("?");
+            println!("\x1b[1;36m[{time_short}]\x1b[0m \x1b[0;35m[output]\x1b[0m {turn_id} from {agent}");
+        }
+        "agent-complete" => {
+            let turn_id = v.get("turn_id").and_then(Value::as_str).unwrap_or("?");
+            let exit_code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+            let status = if exit_code == 0 { "\x1b[1;32m✓\x1b[0m" } else { "\x1b[1;31m✗\x1b[0m" };
+            println!("\x1b[1;36m[{time_short}]\x1b[0m {status} agent complete {turn_id} exit_code={exit_code}");
+        }
+        "signal-parsed" => {
+            let turn_id = v.get("turn_id").and_then(Value::as_str).unwrap_or("?");
+            let verdict = v.get("verdict").and_then(Value::as_str).unwrap_or("?");
+            let color = match verdict {
+                "approve" => "\x1b[1;32m",
+                "reject" => "\x1b[1;31m",
+                _ => "\x1b[1;33m",
+            };
+            println!("\x1b[1;36m[{time_short}]\x1b[0m {color}SIGNAL\x1b[0m {turn_id} verdict={verdict}");
+        }
+        "convergence-check" => {
+            let phase = v.get("phase").and_then(Value::as_str).unwrap_or("?");
+            let converged = v.get("converged").and_then(Value::as_bool).unwrap_or(false);
+            let blockers = v.get("blockers").and_then(Value::as_i64).unwrap_or(0);
+            let status = if converged {
+                "\x1b[1;32m✓ CONVERGED\x1b[0m".to_string()
+            } else {
+                format!("\x1b[1;31m✗ BLOCKED\x1b[0m ({blockers} blockers)")
+            };
+            println!("\x1b[1;36m[{time_short}]\x1b[0m {status} phase={phase}");
+        }
+        "phase-transition" => {
+            let from = v.get("from").and_then(Value::as_str).unwrap_or("?");
+            let to = v.get("to").and_then(Value::as_str).unwrap_or("?");
+            println!("\x1b[1;36m[{time_short}]\x1b[0m \x1b[1;36m→ PHASE\x1b[0m {from} → {to}");
+        }
         "system" => {
             let model = v.get("model").and_then(Value::as_str).unwrap_or("?");
             let session = v.get("session_id").and_then(Value::as_str).unwrap_or("?");

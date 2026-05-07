@@ -3,7 +3,7 @@ use crate::fsutil::{dialec_dir, ensure_dir, write_json_pretty};
 use crate::git;
 use crate::ledger::{Ledger, signal_converged};
 use crate::model::{Config, DialecState, RunRequest, RunTransaction};
-use crate::session::{log_cost, log_decision, log_timeline, read_state, sanitize, write_state};
+use crate::session::{log_activity, log_cost, log_decision, log_timeline, read_state, sanitize, write_state};
 use crate::transaction::run_transaction;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -207,9 +207,17 @@ fn drive_spec(
             },
         )?;
         promote_final_message(root, &tx, &review)?;
-        if signal_converged(&tx.signal)
-            && Ledger::read(root)?.open_blocking("spec", None).is_empty()
-        {
+
+        let converged = signal_converged(&tx.signal);
+        let blockers = Ledger::read(root)?.open_blocking("spec", None);
+        let _ = log_activity(root, "convergence-check", Some(json!({
+            "phase": "spec",
+            "converged": converged && blockers.is_empty(),
+            "blockers": blockers.len(),
+            "round": round,
+        })));
+
+        if converged && blockers.is_empty() {
             require_user_approval(root, state, "spec", None)?;
             let final_spec = phase_dir.join("final.md");
             fs::copy(&draft, &final_spec)
@@ -231,7 +239,12 @@ fn drive_spec(
             )?;
             update_memory(root, "spec", &[final_spec.clone(), review.clone()])?;
             mark_phase(state, "spec", "converged");
+            let prev_phase = state.current_phase.clone();
             state.current_phase = "implement".to_string();
+            let _ = log_activity(root, "phase-transition", Some(json!({
+                "from": prev_phase,
+                "to": state.current_phase,
+            })));
             write_state(root, state)?;
             log_timeline(
                 root,
@@ -329,7 +342,12 @@ fn drive_implementation(
             .join("phase-impl")
             .join("pods.json")],
     )?;
+    let prev_phase = state.current_phase.clone();
     state.current_phase = "cleanup".to_string();
+    let _ = log_activity(root, "phase-transition", Some(json!({
+        "from": prev_phase,
+        "to": state.current_phase,
+    })));
     write_state(root, state)?;
     log_timeline(
         root,
@@ -510,11 +528,18 @@ fn drive_pod(
         promote_final_message(root, &tx, &verify_report)?;
         let _ = git::remove_worktree(root, &verify_name, true);
 
-        if !signal_converged(&tx.signal)
-            || !Ledger::read(root)?
-                .open_blocking("implement", Some(&pod.name))
-                .is_empty()
-        {
+        let converged = signal_converged(&tx.signal);
+        let blockers = Ledger::read(root)?
+            .open_blocking("implement", Some(&pod.name));
+        let _ = log_activity(root, "convergence-check", Some(json!({
+            "phase": "implement",
+            "pod": pod.name,
+            "converged": converged && blockers.is_empty(),
+            "blockers": blockers.len(),
+            "round": round,
+        })));
+
+        if !converged || !blockers.is_empty() {
             continue;
         }
 
@@ -763,11 +788,18 @@ fn drive_cleanup(
             },
         )?;
         promote_final_message(root, &tx, &review)?;
-        if signal_converged(&tx.signal)
-            && Ledger::read(root)?
-                .open_blocking("cleanup", None)
-                .is_empty()
-        {
+
+        let converged = signal_converged(&tx.signal);
+        let blockers = Ledger::read(root)?
+            .open_blocking("cleanup", None);
+        let _ = log_activity(root, "convergence-check", Some(json!({
+            "phase": "cleanup",
+            "converged": converged && blockers.is_empty(),
+            "blockers": blockers.len(),
+            "round": round,
+        })));
+
+        if converged && blockers.is_empty() {
             run_verification_commands(root, &phase_dir.join("verification-commands.jsonl"), &spec)?;
             merge_or_escalate(root, &cleanup_branch, "dialec merge cleanup")?;
             if config.workspaces.keep_failed_workspaces {
@@ -791,7 +823,12 @@ fn drive_cleanup(
                 }),
             )?;
             mark_phase(state, "cleanup", "converged");
+            let prev_phase = state.current_phase.clone();
             state.current_phase = "done".to_string();
+            let _ = log_activity(root, "phase-transition", Some(json!({
+                "from": prev_phase,
+                "to": state.current_phase,
+            })));
             write_state(root, state)?;
             log_timeline(
                 root,
