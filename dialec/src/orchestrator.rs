@@ -4,7 +4,9 @@ use crate::git;
 use crate::ledger::{Ledger, signal_converged};
 use crate::model::{Config, DialecState, RunRequest, RunTransaction};
 use crate::session::{log_activity, log_cost, log_decision, log_timeline, read_state, sanitize, write_state};
-use crate::transaction::run_transaction;
+use crate::transaction::{run_transaction, run_transaction_async};
+use crate::fsutil::read_json;
+use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -892,7 +894,9 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         .roles
         .get(run.role)
         .ok_or_else(|| anyhow!("role {} has no harness mapping", run.role))?;
-    let tx = run_transaction(RunRequest {
+
+    // Spawn harness async
+    let turn_id = run_transaction_async(RunRequest {
         phase: run.phase.to_string(),
         role: run.role.to_string(),
         harness: harness.clone(),
@@ -908,6 +912,9 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         max_turns: config.budget.max_turns,
         pane: run.pane,
     })?;
+
+    // Poll for completion
+    let tx = poll_for_turn(root, &turn_id, 1800)?;
     log_timeline(
         root,
         json!({
@@ -1535,6 +1542,38 @@ fn handle_deadlock(
     Err(anyhow!(
         "interactive deadlock in {phase}; inspect .dialec/session/objections.jsonl"
     ))
+}
+
+/// Poll for a turn to complete. Waits for transaction.json to appear and have a non-pending verdict.
+fn poll_for_turn(root: &Path, turn_id: &str, timeout_secs: u64) -> Result<RunTransaction> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let tx_path = dialec_dir(root)
+        .join("session")
+        .join("turns")
+        .join(turn_id)
+        .join("transaction.json");
+
+    loop {
+        if tx_path.exists() {
+            match read_json::<RunTransaction>(&tx_path) {
+                Ok(tx) => {
+                    if tx.signal.verdict != "pending" || !tx.completed_at.to_string().is_empty() {
+                        return Ok(tx);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "turn {turn_id} did not complete within {timeout_secs}s"
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn handle_pod_deadlock(root: &Path, phase: &str, pod: &str, round: u32) -> Result<()> {
