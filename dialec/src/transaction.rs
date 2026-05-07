@@ -380,14 +380,12 @@ pub fn run_transaction_async(req: RunRequest) -> Result<String> {
         }
     });
 
-    // Wait for the background thread to allocate and write the turn_id
-    // The turn directory gets created early in run_transaction (in next_turn_dir)
-    // But run_transaction continues for a bit longer to setup files and probe harness
+    // Wait for the background thread to complete run_transaction and signal the turn_id
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(30);
+    let timeout = std::time::Duration::from_secs(10);
 
     loop {
-        // Check if the background thread has signaled the turn_id
+        // Check if the background thread has completed and signaled the turn_id
         if let Ok(guard) = turn_id_clone.lock() {
             if let Some(id) = guard.as_ref() {
                 return Ok(id.clone());
@@ -399,7 +397,8 @@ pub fn run_transaction_async(req: RunRequest) -> Result<String> {
             return Err(anyhow::anyhow!("timeout waiting for async turn allocation"));
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Sleep briefly before polling again
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
