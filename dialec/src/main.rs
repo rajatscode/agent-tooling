@@ -1,3 +1,4 @@
+mod activity;
 mod capabilities;
 mod channel;
 mod config;
