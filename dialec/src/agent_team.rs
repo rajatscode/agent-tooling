@@ -72,47 +72,46 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
     Ok(config)
 }
 
-/// Spawn a Claude Code session to join the team as a specific role
-pub fn spawn_teammate(
-    team_name: &str,
+/// Spawn a Claude Code session as a specific role to create an artifact.
+/// The agent writes its output to a file, and we poll for that file to detect completion.
+pub fn spawn_agent_for_artifact(
     role: &str,
     phase: &str,
     task_desc: &str,
     workspace: &Path,
+    output_file: &Path,
 ) -> Result<String> {
-    let task_file = home::home_dir()
-        .context("no home directory")?
-        .join(".claude")
-        .join("tasks")
-        .join(team_name)
-        .join(format!("{}-{}-*", phase, role));
-
     let prompt = format!(
-        r#"You are the {} in a Dialec agent team coordinating through a shared task list.
+        r#"You are the {role} in a Dialec adversarial review phase.
 
-Role: {}
-Phase: {}
+Your task:
+{task_desc}
 
-Your task is: {}
+CRITICAL: Write your final output to this exact file:
+{output_file}
 
-Task Coordination:
-- Your task file is at: ~/.claude/tasks/{}/
-- Look for a file matching pattern: {}-{}-*.json
-- Read the full task description from there
-- Update the file when you're done with:
-  {{
-    "status": "completed",
-    "result": {{
-      "verdict": "approved" or "rejected",
-      "summary": "your summary",
-      "objections": [ ... ]
+Your output format MUST be JSON:
+{{
+  "verdict": "approved" or "rejected",
+  "summary": "brief summary of your work",
+  "objections": [
+    {{
+      "type": "correctness|clarity|completeness|architecture|process",
+      "severity": "critical|major|minor",
+      "issue": "description",
+      "location": "where in the spec/code",
+      "fix": "how to fix it"
     }}
-  }}
+  ]
+}}
 
-Work in the workspace: {}
+Work in: {workspace}
 
-Complete your task and update the task file with your verdict."#,
-        role, role, phase, task_desc, team_name, phase, role, workspace.display()
+Write to {output_file} and exit when done."#,
+        role = role,
+        task_desc = task_desc,
+        output_file = output_file.display(),
+        workspace = workspace.display()
     );
 
     let session_id = Uuid::new_v4().to_string();
@@ -123,7 +122,6 @@ Complete your task and update the task file with your verdict."#,
         .arg(&prompt)
         .arg("--dangerously-skip-permissions")
         .current_dir(workspace)
-        .env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
         .spawn()
         .context("failed to spawn Claude Code session")?;
 
@@ -186,44 +184,31 @@ pub fn create_task(
     Ok(task_id)
 }
 
-/// Poll for task completion
+/// Poll for agent output file and parse the result
 ///
-/// Claude Code sessions are spawned asynchronously. This polls the task file
-/// waiting for it to be marked complete. If timeout is reached, the task is
-/// considered processed (Claude should have completed and produced output).
-pub fn poll_task_completion(
-    team_name: &str,
-    task_id: &str,
+/// Agents write JSON output to a file. This polls for that file's existence
+/// and reads the result when it appears.
+pub fn poll_agent_output(
+    output_file: &Path,
     timeout_secs: u64,
 ) -> Result<TaskResult> {
-    let task_dir = home::home_dir()
-        .context("no home directory")?
-        .join(".claude")
-        .join("tasks")
-        .join(team_name);
-
-    let task_file = task_dir.join(format!("{}.json", task_id));
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
     loop {
-        if task_file.exists() {
-            if let Ok(task) = read_json::<TeamTask>(&task_file) {
-                // Check if task has been explicitly marked complete with a result
-                if task.status == "completed" && task.result.is_some() {
-                    return Ok(task.result.unwrap());
+        if output_file.exists() {
+            if let Ok(content) = fs::read_to_string(output_file) {
+                if let Ok(result) = serde_json::from_str::<TaskResult>(&content) {
+                    return Ok(result);
                 }
             }
         }
 
         if start.elapsed() > timeout {
-            // Timeout - assume task was processed by Claude and default to approved
-            // Claude may have produced output but not updated the JSON file
-            return Ok(TaskResult {
-                verdict: "approved".to_string(),
-                summary: "Task processing completed (timeout)".to_string(),
-                objections: vec![],
-            });
+            return Err(anyhow!(
+                "Timeout waiting for agent output at {}",
+                output_file.display()
+            ));
         }
 
         thread::sleep(Duration::from_millis(500));

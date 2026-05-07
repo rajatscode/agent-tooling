@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct DriveOptions {
@@ -901,77 +902,106 @@ struct RoleRun<'a> {
 }
 
 fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransaction> {
-    // Get the team name from the session state
     let state = read_state(root)?;
-    let team_name = format!("dialec-{}", &state.session_id[..8]);
+    let turn_id = format!("{}-{}-{}", run.phase, run.role, Uuid::new_v4().to_string()[..8].to_string());
 
-    // Create a task in the Agent Team's task list
-    let task_id = agent_team::create_task(
-        &team_name,
-        run.role,
-        run.phase,
-        &run.task,
-    ).context("failed to create Agent Team task")?;
+    // Create output directory for this turn
+    let turn_dir = dialec_dir(root).join("session").join("turns").join(&turn_id);
+    ensure_dir(&turn_dir)?;
+    let output_file = turn_dir.join("result.json");
 
     eprintln!(
-        "Created task {} for role {} in phase {}",
-        task_id, run.role, run.phase
+        "Running {} in phase {} (turn: {})",
+        run.role, run.phase, turn_id
     );
 
-    // Spawn a Claude Code session that will join the team and work on the task
-    // The session reads its task from the shared task list and updates it when done
-    let team_join_prompt = format!(
-        r#"You are joining an Agent Team to act as the "{role}" in the "{phase}" phase.
-
-Team name: {team_name}
-Task ID: {task_id}
-Workspace: {workspace}
-
-Your task is defined in the shared task list. Work in the specified workspace and update the task with your results.
-
-Process:
-1. Read your task from ~/.claude/tasks/{team_name}/{task_id}.json
-2. Do the work specified in the task description
-3. Write results to the workspace as needed
-4. Update the task status to "completed" and include your verdict
-5. End by outputting a structured convergence signal with:
-   - verdict: "approved" or "rejected"
-   - summary: brief summary of your work
-   - objections: any blocking issues
-
-Work autonomously until the task is complete. The team orchestrator will detect your completion."#,
-        role = run.role,
-        phase = run.phase,
-        team_name = team_name,
-        task_id = task_id,
-        workspace = run.workspace.display()
-    );
-
-    agent_team::spawn_teammate(
-        &team_name,
+    // Spawn agent to write output file
+    agent_team::spawn_agent_for_artifact(
         run.role,
         run.phase,
         &run.task,
         run.workspace,
-    ).context("failed to spawn Agent Team teammate")?;
+        &output_file,
+    ).context("failed to spawn agent")?;
 
     eprintln!("Spawned Claude Code session for {}", run.role);
 
-    // Poll the task list for completion
-    let result = agent_team::poll_task_completion(&team_name, &task_id, 1800)
-        .context("failed waiting for task completion")?;
+    // Poll for agent output (timeout 30 minutes for complex work like implementation)
+    let result = agent_team::poll_agent_output(&output_file, 1800)
+        .context("failed waiting for agent output")?;
 
-    eprintln!("Task {} completed with verdict: {}", task_id, result.verdict);
+    eprintln!("Agent {} completed with verdict: {}", run.role, result.verdict);
 
-    // Convert task result to RunTransaction for compatibility
-    let tx = agent_team::task_result_to_transaction(
-        root,
-        &task_id,
-        run.role,
-        run.phase,
-        run.workspace,
-        &result,
-    )?;
+    // Convert to RunTransaction
+    let now = Utc::now();
+    let before = git::snapshot(run.workspace);
+    let after = git::snapshot(run.workspace);
+
+    let signal = crate::model::ConvergenceSignal {
+        verdict: result.verdict.clone(),
+        summary: result.summary.clone(),
+        objections: result.objections.clone(),
+        resolved_objection_ids: vec![],
+        new_objection_ids: vec![],
+    };
+
+    let tx = RunTransaction {
+        id: turn_id.clone(),
+        phase: run.phase.to_string(),
+        pod: None,
+        role: run.role.to_string(),
+        harness: "claude".to_string(),
+        harness_version: Some("agent-file".to_string()),
+        workspace: run.workspace.to_string_lossy().to_string(),
+        started_at: now,
+        completed_at: now,
+        command: crate::model::CommandInvocation {
+            argv: vec!["claude".to_string(), "-p".to_string(), "agent".to_string()],
+            cwd: run.workspace.to_string_lossy().to_string(),
+            timeout_ms: 1_800_000,
+            env_allowlist: std::collections::BTreeMap::new(),
+        },
+        input_artifacts: vec![],
+        before,
+        after,
+        stdout: crate::model::ArtifactRef {
+            id: "stdout".to_string(),
+            path: output_file.to_string_lossy().to_string(),
+            sha256: "".to_string(),
+            artifact_type: "stdout".to_string(),
+        },
+        stderr: crate::model::ArtifactRef {
+            id: "stderr".to_string(),
+            path: "/dev/null".to_string(),
+            sha256: "".to_string(),
+            artifact_type: "stderr".to_string(),
+        },
+        event_log: None,
+        final_message: crate::model::ArtifactRef {
+            id: "final-message".to_string(),
+            path: "/dev/null".to_string(),
+            sha256: "".to_string(),
+            artifact_type: "final-message".to_string(),
+        },
+        structured: crate::model::ArtifactRef {
+            id: "structured".to_string(),
+            path: output_file.to_string_lossy().to_string(),
+            sha256: "".to_string(),
+            artifact_type: "structured".to_string(),
+        },
+        signal,
+        patch: crate::model::ArtifactRef {
+            id: "patch".to_string(),
+            path: "/dev/null".to_string(),
+            sha256: "".to_string(),
+            artifact_type: "patch".to_string(),
+        },
+        cost: None,
+        resume_from: None,
+        session_id: None,
+        exit_code: 0,
+        error: None,
+    };
 
     log_timeline(
         root,
