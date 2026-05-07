@@ -51,11 +51,11 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
     let mut state =
         read_state(root).context("no Dialec session found; run `dialec start` first")?;
     let config = load_or_default(root)?;
-    let configured_rounds = options.max_rounds.unwrap_or(config.convergence.max_rounds);
     let max_rounds = if state.mode == "autonomous" {
-        configured_rounds.min(3)
+        // Autonomous mode: default to 10 rounds to allow convergence loops
+        options.max_rounds.unwrap_or(10)
     } else {
-        configured_rounds
+        options.max_rounds.unwrap_or(config.convergence.max_rounds)
     };
     let pane = options.pane;
 
