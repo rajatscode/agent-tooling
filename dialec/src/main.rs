@@ -1172,7 +1172,6 @@ fn tail_file(path: &Path, follow: bool, raw: bool) -> Result<()> {
         return Ok(());
     }
     let mut pos = file.stream_position()?;
-    let mut no_change_count = 0u32;
     loop {
         thread::sleep(Duration::from_millis(500));
         let len = fs::metadata(path)?.len();
@@ -1180,17 +1179,8 @@ fn tail_file(path: &Path, follow: bool, raw: bool) -> Result<()> {
             pos = 0;
         }
         if len == pos {
-            // File hasn't grown. Increment counter.
-            no_change_count += 1;
-            // If file hasn't changed for 5 seconds (10 iterations × 500ms), stop following.
-            // This handles the case where the process writing to the file has finished.
-            if no_change_count >= 10 {
-                break;
-            }
             continue;
         }
-        // File has new data, reset counter
-        no_change_count = 0;
         file.seek(SeekFrom::Start(pos))?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
@@ -1203,7 +1193,6 @@ fn tail_file(path: &Path, follow: bool, raw: bool) -> Result<()> {
         }
         pos = file.stream_position()?;
     }
-    Ok(())
 }
 
 fn pretty_print_event(line: &str) {

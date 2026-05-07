@@ -21,7 +21,7 @@ pub fn default_config() -> Config {
                 ("systemPrompt", json!(["--append-system-prompt-file"])),
                 ("schema", json!(["--json-schema"])),
                 ("cwd", json!(null)),
-                ("extraFlags", json!(["--bare"])),
+                ("extraFlags", json!([])),
             ]),
         },
     );
