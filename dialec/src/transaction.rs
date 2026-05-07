@@ -361,22 +361,46 @@ pub fn run_transaction(req: RunRequest) -> Result<RunTransaction> {
 /// Spawn a turn async - returns the turn ID immediately after starting the harness in background.
 /// The harness will write transaction.json when done.
 pub fn run_transaction_async(req: RunRequest) -> Result<String> {
-    // Pre-allocate the turn ID by calling next_turn_dir
-    let (turn_id, turn_dir) = crate::session::next_turn_dir(&req.project_root, &req.harness, &req.role)?;
-    let turn_id_clone = turn_id.clone();
+    // Use a shared variable to get the turn_id from the background thread
+    let turn_id_box = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let turn_id_clone = turn_id_box.clone();
 
     // Spawn the actual transaction in a background thread
-    // Important: the turn directory already exists, so run_transaction must not call next_turn_dir
-    // Instead, we need to modify how we handle the turn directory
     std::thread::spawn(move || {
-        if let Err(e) = run_transaction(req) {
-            let error_log = turn_dir.join("error.log");
-            let _ = fs::write(&error_log, format!("async run error: {}\n{:?}", e, e));
+        match run_transaction(req) {
+            Ok(tx) => {
+                // Store the turn_id so the foreground thread can return it
+                if let Ok(mut guard) = turn_id_box.lock() {
+                    *guard = Some(tx.id.clone());
+                }
+            }
+            Err(e) => {
+                eprintln!("async run_transaction error: {:?}", e);
+            }
         }
     });
 
-    // Return immediately with the turn ID
-    Ok(turn_id_clone)
+    // Wait for the background thread to allocate and write the turn_id
+    // The turn directory gets created early in run_transaction (in next_turn_dir)
+    // But run_transaction continues for a bit longer to setup files and probe harness
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+
+    loop {
+        // Check if the background thread has signaled the turn_id
+        if let Ok(guard) = turn_id_clone.lock() {
+            if let Some(id) = guard.as_ref() {
+                return Ok(id.clone());
+            }
+        }
+
+        // Check if we've waited long enough
+        if start.elapsed() > timeout {
+            return Err(anyhow::anyhow!("timeout waiting for async turn allocation"));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Finalize a pane-mode turn after the harness exits.
