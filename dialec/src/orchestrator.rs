@@ -313,6 +313,15 @@ fn drive_spec(
         return Ok(());
     }
 
+    // In autonomous mode, if we exhausted rounds without convergence, just move forward
+    // (the next phase can detect blockers and handle accordingly)
+    if state.mode == "autonomous" {
+        eprintln!("spec phase exhausted {} rounds without convergence, moving to implement", max_rounds);
+        state.current_phase = "implement".to_string();
+        write_state(root, state)?;
+        return Ok(());
+    }
+
     handle_deadlock(root, state, "spec", None, max_rounds)
 }
 
@@ -600,6 +609,17 @@ fn drive_pod(
             .open_blocking("implement", Some(&pod.name))
             .is_empty()
     {
+        return Ok(PodResult {
+            name: pod.name.clone(),
+            branch: impl_branch,
+            worktree_name: impl_name,
+        });
+    }
+
+    // In autonomous mode, accept max_rounds exhausted and return
+    let state = read_state(root)?;
+    if state.mode == "autonomous" {
+        eprintln!("pod {} exhausted {} rounds without convergence", pod.name, max_rounds);
         return Ok(PodResult {
             name: pod.name.clone(),
             branch: impl_branch,
@@ -897,6 +917,14 @@ fn drive_cleanup(
             }),
         )?;
         mark_phase(state, "cleanup", "converged-by-arbiter");
+        state.current_phase = "done".to_string();
+        write_state(root, state)?;
+        return Ok(());
+    }
+
+    // In autonomous mode, if we exhausted rounds without convergence, move to done
+    if state.mode == "autonomous" {
+        eprintln!("cleanup phase exhausted {} rounds without convergence, moving to done", max_rounds);
         state.current_phase = "done".to_string();
         write_state(root, state)?;
         return Ok(());
