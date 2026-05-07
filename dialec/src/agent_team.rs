@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::ffi::CString;
 use uuid::Uuid;
 use chrono::Utc;
 
@@ -117,29 +118,50 @@ Write to {output_file} and exit when done."#,
 
     let session_id = Uuid::new_v4().to_string();
 
-    // Spawn agent session in background with appropriate flags for each harness
-    let mut cmd = Command::new(harness);
-    cmd.current_dir(workspace);
+    // Use forkpty to allocate a PTY and fork a child process connected to it.
+    // This ensures the child has a real TTY, which satisfies codex's isatty() checks.
+    unsafe {
+        let mut master_fd: libc::c_int = 0;
+        let pid = libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
 
-    if harness == "codex" {
-        // codex: prompt is positional argument, use dangerously-bypass-approvals-and-sandbox
-        cmd.arg(&prompt)
-            .arg("--dangerously-bypass-approvals-and-sandbox");
-    } else {
-        // claude: use -p flag for prompt, use dangerously-skip-permissions
-        cmd.arg("-p")
-            .arg(&prompt)
-            .arg("--dangerously-skip-permissions");
+        if pid == -1 {
+            return Err(anyhow::anyhow!("forkpty failed"));
+        } else if pid == 0 {
+            // Child process: connected to PTY slave, spawn the agent
+            // Change to workspace directory
+            let _ = std::env::set_current_dir(workspace);
+
+            let mut cmd = Command::new(harness);
+
+            if harness == "codex" {
+                // codex: prompt is positional argument, use dangerously-bypass-approvals-and-sandbox
+                cmd.arg(&prompt)
+                    .arg("--dangerously-bypass-approvals-and-sandbox");
+            } else {
+                // claude: use -p flag for prompt, use dangerously-skip-permissions
+                cmd.arg("-p")
+                    .arg(&prompt)
+                    .arg("--dangerously-skip-permissions");
+            }
+
+            // Spawn the agent. It inherits the PTY connection from forkpty.
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    std::process::exit(0);
+                }
+                Err(_) => {
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Parent process: child is running in background with PTY
+            // Close the master FD since we don't need it
+            libc::close(master_fd);
+            // Detach and return immediately
+            Ok(session_id)
+        }
     }
-
-    // For background execution, redirect stdin from /dev/null so agents don't block
-    // They don't read from stdin anyway - they just read files and write result.json
-    cmd.stdin(Stdio::null());
-
-    let _child = cmd.spawn()
-        .with_context(|| format!("failed to spawn {} session", harness))?;
-
-    Ok(session_id)
 }
 
 /// Task structure for the shared task list

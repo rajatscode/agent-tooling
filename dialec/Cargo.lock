@@ -204,6 +204,7 @@ dependencies = [
  "clap",
  "hex",
  "home",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
