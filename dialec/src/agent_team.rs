@@ -117,18 +117,19 @@ Write to {output_file} and exit when done."#,
 
     let session_id = Uuid::new_v4().to_string();
 
-    // Spawn agent session in background with -p (headless) mode
+    // Spawn agent session in background with appropriate flags for each harness
     let mut cmd = Command::new(harness);
-    cmd.arg("-p")
-        .arg(&prompt)
-        .current_dir(workspace);
+    cmd.current_dir(workspace);
 
-    // Use correct permission flag for each harness
     if harness == "codex" {
-        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+        // codex: prompt is positional argument, use dangerously-bypass-approvals-and-sandbox
+        cmd.arg(&prompt)
+            .arg("--dangerously-bypass-approvals-and-sandbox");
     } else {
-        // claude uses this flag
-        cmd.arg("--dangerously-skip-permissions");
+        // claude: use -p flag for prompt, use dangerously-skip-permissions
+        cmd.arg("-p")
+            .arg(&prompt)
+            .arg("--dangerously-skip-permissions");
     }
 
     let _child = cmd.spawn()
