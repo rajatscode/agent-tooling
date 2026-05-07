@@ -103,14 +103,38 @@ pub fn create_worktree(root: &Path, name: &str, base: Option<&str>) -> Result<Pa
     if path.exists() {
         return Ok(path);
     }
+
+    // Prune stale worktree entries before creating new one
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(root)
+        .output();
+
     let branch = format!("dialec/{name}");
+
+    // Check if branch already exists to avoid "already exists" error
+    let branch_exists = Command::new("git")
+        .args(["rev-parse", "--verify", &branch])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     let mut cmd = Command::new("git");
     cmd.args(["worktree", "add"])
-        .arg(&path)
-        .args(["-b", &branch]);
-    if let Some(base) = base {
-        cmd.arg(base);
+        .arg(&path);
+
+    if branch_exists {
+        // Branch exists, check out existing branch
+        cmd.arg(&branch);
+    } else {
+        // Branch doesn't exist, create new branch
+        cmd.args(["-b", &branch]);
+        if let Some(base) = base {
+            cmd.arg(base);
+        }
     }
+
     let output = cmd
         .current_dir(root)
         .output()
