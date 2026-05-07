@@ -118,12 +118,20 @@ Write to {output_file} and exit when done."#,
     let session_id = Uuid::new_v4().to_string();
 
     // Spawn agent session in background with -p (headless) mode
-    let _child = Command::new(harness)
-        .arg("-p")
+    let mut cmd = Command::new(harness);
+    cmd.arg("-p")
         .arg(&prompt)
-        .arg("--dangerously-skip-permissions")
-        .current_dir(workspace)
-        .spawn()
+        .current_dir(workspace);
+
+    // Use correct permission flag for each harness
+    if harness == "codex" {
+        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+        // claude uses this flag
+        cmd.arg("--dangerously-skip-permissions");
+    }
+
+    let _child = cmd.spawn()
         .with_context(|| format!("failed to spawn {} session", harness))?;
 
     Ok(session_id)
