@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -131,6 +131,11 @@ Write to {output_file} and exit when done."#,
             .arg(&prompt)
             .arg("--dangerously-skip-permissions");
     }
+
+    // Redirect stdio for background execution (agents don't need interactive terminal)
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     let _child = cmd.spawn()
         .with_context(|| format!("failed to spawn {} session", harness))?;
