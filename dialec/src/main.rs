@@ -8,6 +8,7 @@ mod model;
 mod orchestrator;
 mod schema;
 mod session;
+mod status;
 mod transaction;
 
 use anyhow::{Context, Result};
@@ -198,6 +199,9 @@ struct WorkflowRunArgs {
 struct StatusArgs {
     #[arg(long)]
     json: bool,
+    /// Show convergence status for current phase (for agents)
+    #[arg(long)]
+    convergence: bool,
 }
 
 #[derive(Debug, Args)]
@@ -527,6 +531,19 @@ fn cmd_status(root: PathBuf, args: StatusArgs) -> Result<()> {
             dialec_dir(&root).display()
         )
     })?;
+
+    if args.convergence {
+        // Agent query: am I converged? Returns JSON for machine-readable answer.
+        let converged = status::is_converged(&root, &state.current_phase)?;
+        let blocker_msg = status::blocker_summary(&root, &state.current_phase)?;
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "phase": state.current_phase,
+            "converged": converged,
+            "summary": blocker_msg,
+        }))?);
+        return Ok(());
+    }
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&state)?);
     } else {
