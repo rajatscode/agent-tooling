@@ -214,6 +214,8 @@ struct LogArgs {
     pod: Option<String>,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    #[arg(long, short)]
+    follow: bool,
 }
 
 #[derive(Debug, Args)]
@@ -579,29 +581,64 @@ fn cmd_status(root: PathBuf, args: StatusArgs) -> Result<()> {
 
 fn cmd_log(root: PathBuf, args: LogArgs) -> Result<()> {
     let log_path = dialec_dir(&root).join("log").join("timeline.jsonl");
-    let content = fs::read_to_string(&log_path)
-        .with_context(|| format!("failed to read {}", log_path.display()))?;
-    let mut rows: Vec<Value> = content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|value| {
-            args.phase.as_ref().is_none_or(|phase| {
-                value.get("phase").and_then(Value::as_str) == Some(phase.as_str())
+
+    if args.follow {
+        // Follow mode: keep tailing the log file
+        let mut last_pos = 0usize;
+        loop {
+            if let Ok(content) = fs::read_to_string(&log_path) {
+                let lines: Vec<&str> = content.lines().collect();
+                let mut rows: Vec<Value> = lines
+                    .iter()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter(|value| {
+                        args.phase.as_ref().is_none_or(|phase| {
+                            value.get("phase").and_then(Value::as_str) == Some(phase.as_str())
+                        })
+                    })
+                    .filter(|value| {
+                        args.pod
+                            .as_ref()
+                            .is_none_or(|pod| value.get("pod").and_then(Value::as_str) == Some(pod.as_str()))
+                    })
+                    .collect();
+
+                // Print new lines since last read
+                if rows.len() > last_pos {
+                    for row in &rows[last_pos..] {
+                        println!("{}", serde_json::to_string(row)?);
+                    }
+                    last_pos = rows.len();
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    } else {
+        // Standard mode: print last N lines
+        let content = fs::read_to_string(&log_path)
+            .with_context(|| format!("failed to read {}", log_path.display()))?;
+        let mut rows: Vec<Value> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| {
+                args.phase.as_ref().is_none_or(|phase| {
+                    value.get("phase").and_then(Value::as_str) == Some(phase.as_str())
+                })
             })
-        })
-        .filter(|value| {
-            args.pod
-                .as_ref()
-                .is_none_or(|pod| value.get("pod").and_then(Value::as_str) == Some(pod.as_str()))
-        })
-        .collect();
-    if rows.len() > args.limit {
-        rows = rows.split_off(rows.len() - args.limit);
+            .filter(|value| {
+                args.pod
+                    .as_ref()
+                    .is_none_or(|pod| value.get("pod").and_then(Value::as_str) == Some(pod.as_str()))
+            })
+            .collect();
+        if rows.len() > args.limit {
+            rows = rows.split_off(rows.len() - args.limit);
+        }
+        for row in rows {
+            println!("{}", serde_json::to_string(&row)?);
+        }
+        Ok(())
     }
-    for row in rows {
-        println!("{}", serde_json::to_string(&row)?);
-    }
-    Ok(())
 }
 
 fn cmd_run(root: PathBuf, args: RunArgs) -> Result<()> {
