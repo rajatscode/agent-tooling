@@ -563,8 +563,7 @@ fn build_command(
                 "json".to_string(),
                 "--json-schema".to_string(),
                 schema_file.to_string_lossy().to_string(),
-                "--permission-mode".to_string(),
-                "bypassPermissions".to_string(),
+                "--dangerously-skip-permissions".to_string(),
             ];
             if role_file.exists() {
                 args.push("--append-system-prompt-file".to_string());
