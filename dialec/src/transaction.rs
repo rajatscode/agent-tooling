@@ -17,7 +17,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -559,11 +559,12 @@ fn build_command(
             let mut args = vec![
                 "-p".to_string(),
                 task.to_string(),
-                "--bare".to_string(),
                 "--output-format".to_string(),
                 "json".to_string(),
                 "--json-schema".to_string(),
                 schema_file.to_string_lossy().to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
             ];
             if role_file.exists() {
                 args.push("--append-system-prompt-file".to_string());
@@ -656,6 +657,7 @@ fn run_external(
     let mut child = Command::new(program)
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
