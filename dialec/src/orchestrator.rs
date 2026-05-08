@@ -178,11 +178,14 @@ fn drive_spec(
     // Loop until convergence, not just for max_rounds
     let mut round = 1u32;
     loop {
+        eprintln!("[drive_spec] Round {}: Checking if round > max_rounds ({} > {})", round, round, max_rounds);
         if round > max_rounds {
             eprintln!("spec phase did not converge after {} rounds", max_rounds);
             break;
         }
         let draft = phase_dir.join(format!("draft-{round}.md"));
+        eprintln!("[drive_spec] Round {}: draft path is {}", round, draft.display());
+        eprintln!("[drive_spec] Round {}: draft exists: {}", round, draft.exists());
         if !draft.exists() {
             let tx = run_role(
                 root,
@@ -231,7 +234,10 @@ fn drive_spec(
         promote_final_message(root, &tx, &review)?;
 
         let converged = signal_converged(&tx.signal);
+        eprintln!("[drive_spec] Round {}: signal_converged = {}", round, converged);
+        eprintln!("[drive_spec] Round {}: verdict = {}", round, tx.signal.verdict);
         let blockers = Ledger::read(root)?.open_blocking("spec", None);
+        eprintln!("[drive_spec] Round {}: blockers.len() = {}", round, blockers.len());
         let _ = log_activity(root, "convergence-check", Some(json!({
             "phase": "spec",
             "converged": converged && blockers.is_empty(),
@@ -239,6 +245,7 @@ fn drive_spec(
             "round": round,
         })));
 
+        eprintln!("[drive_spec] Round {}: Checking if converged && blockers.is_empty() ({} && {})", round, converged, blockers.is_empty());
         if converged && blockers.is_empty() {
             require_user_approval(root, state, "spec", None, autopilot)?;
             let final_spec = phase_dir.join("final.md");
@@ -277,7 +284,9 @@ fn drive_spec(
         }
 
         // Not converged, increment round and loop
+        eprintln!("[drive_spec] Round {}: Not converged, incrementing to round {}", round, round + 1);
         round += 1;
+        eprintln!("[drive_spec] Looping back to top with round = {}", round);
     }
 
     if config.convergence.use_arbiter
@@ -1021,10 +1030,26 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
     let before = git::snapshot(run.workspace);
     let after = git::snapshot(run.workspace);
 
+    // Convert AgentObjection to model::Objection for compatibility
+    let objections = result.objections.iter().map(|obj| {
+        crate::model::Objection {
+            id: Uuid::new_v4().to_string(),
+            category: obj.objection_type.clone(),
+            severity: obj.severity.clone(),
+            description: obj.issue.clone(),
+            blocking: matches!(obj.severity.as_str(), "critical" | "major"),
+            evidence: obj.issue.clone(),
+            proposed_resolution: Some(obj.fix.clone()),
+            location: Some(obj.location.clone()),
+            owner: None,
+            status: "open".to_string(),
+        }
+    }).collect();
+
     let signal = crate::model::ConvergenceSignal {
         verdict: result.verdict.clone(),
         summary: result.summary.clone(),
-        objections: result.objections.clone(),
+        objections,
         resolved_objection_ids: vec![],
         new_objection_ids: vec![],
     };

@@ -198,6 +198,25 @@ Write to {} and exit when done."#,
     }
 }
 
+/// Objection as written by agent (codex/claude in adversarial mode)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentObjection {
+    #[serde(rename = "type")]
+    pub objection_type: String,  // "correctness|clarity|completeness|architecture|process"
+    pub severity: String,        // "critical|major|minor"
+    pub issue: String,
+    pub location: String,
+    pub fix: String,
+}
+
+/// Result JSON as written by agents during adversarial review
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub verdict: String,
+    pub summary: String,
+    pub objections: Vec<AgentObjection>,
+}
+
 /// Task structure for the shared task list
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamTask {
@@ -210,13 +229,6 @@ pub struct TeamTask {
     pub owner: Option<String>,
     pub blockers: Vec<String>,
     pub result: Option<TaskResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskResult {
-    pub verdict: String,
-    pub summary: String,
-    pub objections: Vec<Objection>,
 }
 
 /// Create a task in the team's task list
@@ -264,14 +276,26 @@ pub fn poll_agent_output(
 ) -> Result<TaskResult> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
+    let mut attempt = 0u32;
 
     loop {
+        attempt += 1;
+        eprintln!("[poll_agent_output] Attempt {}: Checking if {} exists", attempt, output_file.display());
         if output_file.exists() {
+            eprintln!("[poll_agent_output] File exists, reading...");
             if let Ok(content) = fs::read_to_string(output_file) {
+                eprintln!("[poll_agent_output] Read {} bytes", content.len());
                 if let Ok(result) = serde_json::from_str::<TaskResult>(&content) {
+                    eprintln!("[poll_agent_output] Successfully parsed JSON, verdict={}", result.verdict);
                     return Ok(result);
+                } else {
+                    eprintln!("[poll_agent_output] Failed to parse JSON from content");
                 }
+            } else {
+                eprintln!("[poll_agent_output] Failed to read file");
             }
+        } else {
+            eprintln!("[poll_agent_output] File does not exist");
         }
 
         if start.elapsed() > timeout {
@@ -281,6 +305,7 @@ pub fn poll_agent_output(
             ));
         }
 
+        eprintln!("[poll_agent_output] Sleeping 500ms, elapsed: {:?}", start.elapsed());
         thread::sleep(Duration::from_millis(500));
     }
 }
@@ -298,10 +323,26 @@ pub fn task_result_to_transaction(
     let before = snapshot(workspace);
     let after = snapshot(workspace);
 
+    // Convert AgentObjection to model::Objection for compatibility
+    let objections = result.objections.iter().map(|obj| {
+        Objection {
+            id: Uuid::new_v4().to_string(),
+            category: obj.objection_type.clone(),
+            severity: obj.severity.clone(),
+            description: obj.issue.clone(),
+            blocking: matches!(obj.severity.as_str(), "critical" | "major"),
+            evidence: obj.issue.clone(),
+            proposed_resolution: Some(obj.fix.clone()),
+            location: Some(obj.location.clone()),
+            owner: None,
+            status: "open".to_string(),
+        }
+    }).collect();
+
     let signal = ConvergenceSignal {
         verdict: result.verdict.clone(),
         summary: result.summary.clone(),
-        objections: result.objections.clone(),
+        objections,
         resolved_objection_ids: vec![],
         new_objection_ids: vec![],
     };
