@@ -82,6 +82,8 @@ pub fn spawn_agent_for_artifact(
     workspace: &Path,
     output_file: &Path,
     harness: &str,
+    sandbox: &str,
+    approval: &str,
 ) -> Result<u32> {
     let prompt = format!(
         r#"You are the {role} in a Dialec adversarial review phase.
@@ -155,6 +157,8 @@ Write to {} and exit when done."#,
             .arg("--skip-git-repo-check")
             .arg("-m")
             .arg("gpt-5.5")
+            .arg("--approval")
+            .arg(approval)
             .arg(&prompt_with_file)
             .stdin(Stdio::null());
 

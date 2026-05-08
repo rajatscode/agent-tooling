@@ -987,6 +987,8 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         run.workspace,
         &output_file,
         harness,
+        run.sandbox,
+        run.approval,
     ).context("failed to spawn agent")?;
 
     eprintln!("Spawned {} session for {} (pid: {})", harness, run.role, agent_pid);
