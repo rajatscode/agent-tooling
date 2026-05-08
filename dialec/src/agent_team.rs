@@ -130,7 +130,7 @@ Write to {output_file} and exit when done."#,
             .arg("--sandbox")
             .arg("read-only")
             .arg("-m")
-            .arg("claude")  // Override to use Claude instead of gpt-5-codex
+            .arg("gpt-5.5")  // Use available OpenAI model
             .arg(&prompt);
     } else {
         // claude: use -p flag for prompt
