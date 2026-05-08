@@ -122,15 +122,42 @@ Write to {output_file} and exit when done."#,
 
     if harness == "codex" {
         // codex: use 'exec' subcommand for non-interactive batch mode
-        // Tell codex to write the file directly (same as Claude)
+        // Don't use --json (causes stdout streaming, can't write files)
+        // Tell codex to write the file directly like Claude does
+        let prompt_with_file = format!(
+            r#"{}
+
+CRITICAL: Write your final output to this exact file:
+{}
+
+Your output format MUST be JSON:
+{{
+  "verdict": "approved" or "rejected",
+  "summary": "brief summary of your work",
+  "objections": [
+    {{
+      "type": "correctness|clarity|completeness|architecture|process",
+      "severity": "critical|major|minor",
+      "issue": "description",
+      "location": "where in the spec/code",
+      "fix": "how to fix it"
+    }}
+  ]
+}}
+
+Write to {} and exit when done."#,
+            prompt,
+            output_file.display(),
+            output_file.display()
+        );
+
         cmd.arg("exec")
-            .arg("--json")
             .arg("--skip-git-repo-check")
             .arg("--sandbox")
             .arg("read-only")
             .arg("-m")
             .arg("gpt-5.5")
-            .arg(&prompt)
+            .arg(&prompt_with_file)
             .stdin(Stdio::null());
 
         let child = cmd.spawn()
