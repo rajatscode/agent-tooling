@@ -75,6 +75,7 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
 
 /// Spawn an agent (claude or codex) as a specific role to create an artifact.
 /// The agent writes its output to a file, and we poll for that file to detect completion.
+/// Returns the PID of the spawned process so it can be killed when done.
 pub fn spawn_agent_for_artifact(
     role: &str,
     phase: &str,
@@ -82,7 +83,7 @@ pub fn spawn_agent_for_artifact(
     workspace: &Path,
     output_file: &Path,
     harness: &str,
-) -> Result<String> {
+) -> Result<u32> {
     let prompt = format!(
         r#"You are the {role} in a Dialec adversarial review phase.
 
@@ -116,8 +117,6 @@ Write to {output_file} and exit when done."#,
         workspace = workspace.display()
     );
 
-    let session_id = Uuid::new_v4().to_string();
-
     // Spawn agent session in background
     let mut cmd = Command::new(harness);
     cmd.current_dir(workspace);
@@ -141,10 +140,11 @@ Write to {output_file} and exit when done."#,
 
     cmd.stdin(Stdio::null());
 
-    let _child = cmd.spawn()
+    let child = cmd.spawn()
         .with_context(|| format!("failed to spawn {} session", harness))?;
 
-    Ok(session_id)
+    let pid = child.id();
+    Ok(pid)
 }
 
 /// Task structure for the shared task list

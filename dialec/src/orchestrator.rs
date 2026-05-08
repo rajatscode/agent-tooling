@@ -976,7 +976,7 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
     );
 
     // Spawn agent to write output file
-    agent_team::spawn_agent_for_artifact(
+    let agent_pid = agent_team::spawn_agent_for_artifact(
         run.role,
         run.phase,
         &run.task,
@@ -985,11 +985,26 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
         harness,
     ).context("failed to spawn agent")?;
 
-    eprintln!("Spawned {} session for {}", harness, run.role);
+    eprintln!("Spawned {} session for {} (pid: {})", harness, run.role, agent_pid);
 
     // Poll for agent output (timeout 30 minutes for complex work like implementation)
-    let result = agent_team::poll_agent_output(&output_file, 1800)
-        .context("failed waiting for agent output")?;
+    let result = match agent_team::poll_agent_output(&output_file, 1800) {
+        Ok(r) => r,
+        Err(e) => {
+            // Timeout or error: kill the runaway process
+            eprintln!("Killing runaway agent process {} due to: {}", agent_pid, e);
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(agent_pid.to_string())
+                .output();
+            return Err(e).context("failed waiting for agent output");
+        }
+    };
+
+    // Kill the agent process if still running (it should have exited, but Claude CLI sometimes doesn't)
+    let _ = std::process::Command::new("kill")
+        .arg(agent_pid.to_string())
+        .output();
 
     eprintln!("Agent {} completed with verdict: {}", run.role, result.verdict);
 
