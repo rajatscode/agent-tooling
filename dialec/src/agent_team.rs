@@ -73,7 +73,7 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
     Ok(config)
 }
 
-/// Spawn an agent (claude) as a specific role to create an artifact.
+/// Spawn an agent (claude or codex) as a specific role to create an artifact.
 /// The agent writes its output to a file, and we poll for that file to detect completion.
 pub fn spawn_agent_for_artifact(
     role: &str,
@@ -120,11 +120,26 @@ Write to {output_file} and exit when done."#,
 
     // Spawn agent session in background
     let mut cmd = Command::new(harness);
-    cmd.current_dir(workspace)
-        .arg("-p")
-        .arg(&prompt)
-        .arg("--dangerously-skip-permissions")
-        .stdin(Stdio::null());
+    cmd.current_dir(workspace);
+
+    if harness == "codex" {
+        // codex: use 'exec' subcommand for non-interactive batch mode
+        cmd.arg("exec")
+            .arg("--json")
+            .arg("--skip-git-repo-check")
+            .arg("--sandbox")
+            .arg("read-only")
+            .arg("-m")
+            .arg("claude")  // Override to use Claude instead of gpt-5-codex
+            .arg(&prompt);
+    } else {
+        // claude: use -p flag for prompt
+        cmd.arg("-p")
+            .arg(&prompt)
+            .arg("--dangerously-skip-permissions");
+    }
+
+    cmd.stdin(Stdio::null());
 
     let _child = cmd.spawn()
         .with_context(|| format!("failed to spawn {} session", harness))?;

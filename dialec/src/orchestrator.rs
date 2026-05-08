@@ -950,14 +950,18 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
     let turn_id = format!("{}-{}-{}", run.phase, run.role, Uuid::new_v4().to_string()[..8].to_string());
 
     // Determine harness based on phase and role
+    // Use codex exec for adversarial review/verification roles (non-interactive batch mode)
+    // Use claude for implementation/writing roles
     let harness = match (run.phase, run.role) {
-        // All agents use claude for now (codex TTY requirements incompatible with background spawning)
+        // Spec: claude writes, codex reviews
         ("spec", "spec-writer") => "claude",
-        ("spec", "spec-reviewer") => "claude",
+        ("spec", "spec-reviewer") => "codex",
+        // Implement: claude writes, codex reviews
         ("implement", "implementer") => "claude",
-        ("implement", "impl-reviewer") => "claude",
+        ("implement", "impl-reviewer") => "codex",
+        // Cleanup: claude writes, codex reviews
         ("cleanup", "refactorer") => "claude",
-        ("cleanup", "refactor-reviewer") => "claude",
+        ("cleanup", "refactor-reviewer") => "codex",
         _ => "claude", // fallback
     };
 
