@@ -951,15 +951,13 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
 
     // Determine harness based on phase and role
     let harness = match (run.phase, run.role) {
-        // Spec: claude writes, codex reviews
+        // All agents use claude for now (codex TTY requirements incompatible with background spawning)
         ("spec", "spec-writer") => "claude",
-        ("spec", "spec-reviewer") => "codex",
-        // Implement: codex writes, claude reviews
-        ("implement", "implementer") => "codex",
+        ("spec", "spec-reviewer") => "claude",
+        ("implement", "implementer") => "claude",
         ("implement", "impl-reviewer") => "claude",
-        // Cleanup: claude writes, codex reviews
         ("cleanup", "refactorer") => "claude",
-        ("cleanup", "refactor-reviewer") => "codex",
+        ("cleanup", "refactor-reviewer") => "claude",
         _ => "claude", // fallback
     };
 

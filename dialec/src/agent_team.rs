@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::ffi::CString;
+use std::os::unix::process::CommandExt;
 use uuid::Uuid;
 use chrono::Utc;
 
@@ -73,7 +73,7 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
     Ok(config)
 }
 
-/// Spawn an agent (claude or codex) as a specific role to create an artifact.
+/// Spawn an agent (claude) as a specific role to create an artifact.
 /// The agent writes its output to a file, and we poll for that file to detect completion.
 pub fn spawn_agent_for_artifact(
     role: &str,
@@ -118,44 +118,16 @@ Write to {output_file} and exit when done."#,
 
     let session_id = Uuid::new_v4().to_string();
 
-    // Write prompt to temp file to avoid shell escaping issues
-    let prompt_file = format!("/tmp/dialec_prompt_{}.txt", uuid::Uuid::new_v4());
-    fs::write(&prompt_file, &prompt)
-        .with_context(|| format!("failed to write prompt file {}", prompt_file))?;
-
-    // Use 'script' command to allocate a real PTY, ensuring codex's isatty() checks pass.
-    // script -q /dev/null - run in quiet mode, output to /dev/null (we capture via result.json)
-    let shell_cmd = if harness == "codex" {
-        // codex: positional prompt argument, read from file
-        format!(
-            "cd '{}' && PROMPT=\"$(cat {})\" && script -q /dev/null {} \"$PROMPT\" --dangerously-bypass-approvals-and-sandbox",
-            workspace.display(),
-            prompt_file,
-            harness
-        )
-    } else {
-        // claude: -p flag for prompt, read from file
-        format!(
-            "cd '{}' && PROMPT=\"$(cat {})\" && script -q /dev/null {} -p \"$PROMPT\" --dangerously-skip-permissions",
-            workspace.display(),
-            prompt_file,
-            harness
-        )
-    };
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(&shell_cmd)
+    // Spawn agent session in background
+    let mut cmd = Command::new(harness);
+    cmd.current_dir(workspace)
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--dangerously-skip-permissions")
         .stdin(Stdio::null());
 
     let _child = cmd.spawn()
-        .with_context(|| format!("failed to spawn {} session via script PTY", harness))?;
-
-    // Clean up prompt file after a delay (fire and forget)
-    let _ = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(300));
-        let _ = fs::remove_file(&prompt_file);
-    });
+        .with_context(|| format!("failed to spawn {} session", harness))?;
 
     Ok(session_id)
 }
