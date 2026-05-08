@@ -480,6 +480,7 @@ fn cmd_start(root: PathBuf, args: StartArgs) -> Result<()> {
                 phase: None,
                 no_cleanup: false,
                 pane: false,
+                autopilot: true,  // dialec start --drive is autopilot mode
             },
         )?;
         println!("drive completed");
@@ -522,6 +523,7 @@ fn cmd_drive(root: PathBuf, args: DriveArgs) -> Result<()> {
             phase: args.phase,
             no_cleanup: args.no_cleanup,
             pane: args.pane,
+            autopilot: true,  // dialec drive is autopilot mode - skip user approval
         },
     )?;
     println!("drive completed");
@@ -538,6 +540,7 @@ fn cmd_phase(root: PathBuf, phase: &str, args: PhaseArgs) -> Result<()> {
             phase: Some(phase.to_string()),
             no_cleanup: false,
             pane: args.pane,
+            autopilot: true,  // dialec spec/implement/cleanup are autopilot mode
         },
     )?;
     println!("{phase} completed");
@@ -1514,6 +1517,7 @@ fn run_custom_workflow(
                     phase: Some(phase.name.clone()),
                     no_cleanup: false,
                     pane: false,
+                    autopilot: true,  // workflow is autopilot mode
                 },
             )?;
             continue;

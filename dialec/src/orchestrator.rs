@@ -25,6 +25,7 @@ pub struct DriveOptions {
     pub phase: Option<String>,
     pub no_cleanup: bool,
     pub pane: bool,
+    pub autopilot: bool,  // Skip user approval when true (dialec drive mode)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,13 +88,13 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
             .unwrap_or_else(|| state.current_phase.clone());
         match phase.as_str() {
             "spec" => {
-                drive_spec(root, &config, &mut state, max_rounds, pane)?;
+                drive_spec(root, &config, &mut state, max_rounds, pane, options.autopilot)?;
                 if options.phase.is_some() {
                     break;
                 }
             }
             "implement" => {
-                drive_implementation(root, &config, &mut state, max_rounds, options.max_parallel, pane)?;
+                drive_implementation(root, &config, &mut state, max_rounds, options.max_parallel, pane, options.autopilot)?;
                 if options.phase.is_some() {
                     break;
                 }
@@ -104,7 +105,7 @@ pub fn drive(root: &Path, options: DriveOptions) -> Result<()> {
                     write_state(root, &state)?;
                     break;
                 }
-                drive_cleanup(root, &config, &mut state, max_rounds, pane)?;
+                drive_cleanup(root, &config, &mut state, max_rounds, pane, options.autopilot)?;
                 break;
             }
             "done" => {
@@ -165,6 +166,7 @@ fn drive_spec(
     state: &mut DialecState,
     max_rounds: u32,
     pane: bool,
+    autopilot: bool,
 ) -> Result<()> {
     let phase_dir = dialec_dir(root).join("session").join("phase-spec");
     ensure_dir(&phase_dir)?;
@@ -238,7 +240,7 @@ fn drive_spec(
         })));
 
         if converged && blockers.is_empty() {
-            require_user_approval(root, state, "spec", None)?;
+            require_user_approval(root, state, "spec", None, autopilot)?;
             let final_spec = phase_dir.join("final.md");
             fs::copy(&draft, &final_spec)
                 .with_context(|| format!("failed to freeze spec at {}", final_spec.display()))?;
@@ -332,6 +334,7 @@ fn drive_implementation(
     max_rounds: u32,
     max_parallel: usize,
     pane: bool,
+    autopilot: bool,
 ) -> Result<()> {
     if !git::is_git_repo(root) {
         return Err(anyhow!("implementation phase requires a git repository"));
@@ -734,6 +737,7 @@ fn drive_cleanup(
     state: &mut DialecState,
     max_rounds: u32,
     pane: bool,
+    autopilot: bool,
 ) -> Result<()> {
     if !git::is_git_repo(root) {
         return Err(anyhow!("cleanup phase requires a git repository"));
@@ -1201,8 +1205,9 @@ fn require_user_approval(
     state: &DialecState,
     phase: &str,
     pod: Option<&str>,
+    autopilot: bool,
 ) -> Result<()> {
-    if state.mode == "autonomous" {
+    if state.mode == "autonomous" || autopilot {
         return Ok(());
     }
     if user_approval_exists(root, phase, pod) {
