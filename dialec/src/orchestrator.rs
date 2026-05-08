@@ -1002,6 +1002,8 @@ fn run_role(root: &Path, config: &Config, run: RoleRun<'_>) -> Result<RunTransac
     };
 
     // Kill the agent process if still running (it should have exited, but Claude CLI sometimes doesn't)
+    // Wait a moment to ensure output is fully flushed to disk
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = std::process::Command::new("kill")
         .arg(agent_pid.to_string())
         .output();
