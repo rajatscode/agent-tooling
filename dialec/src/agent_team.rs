@@ -74,7 +74,6 @@ pub fn create_team(root: &Path, session_id: &str) -> Result<AgentTeamConfig> {
 }
 
 /// Spawn an agent (claude or codex) as a specific role to create an artifact.
-/// The agent writes its output to a file, and we poll for that file to detect completion.
 /// Returns the PID of the spawned process so it can be killed when done.
 pub fn spawn_agent_for_artifact(
     role: &str,
@@ -123,28 +122,47 @@ Write to {output_file} and exit when done."#,
 
     if harness == "codex" {
         // codex: use 'exec' subcommand for non-interactive batch mode
+        // Tell codex to write the file directly (same as Claude)
         cmd.arg("exec")
             .arg("--json")
             .arg("--skip-git-repo-check")
             .arg("--sandbox")
             .arg("read-only")
             .arg("-m")
-            .arg("gpt-5.5")  // Use available OpenAI model
-            .arg(&prompt);
-    } else {
-        // claude: use -p flag for prompt
-        cmd.arg("-p")
+            .arg("gpt-5.5")
             .arg(&prompt)
-            .arg("--dangerously-skip-permissions");
+            .stdin(Stdio::null());
+
+        let child = cmd.spawn()
+            .with_context(|| format!("failed to spawn {} session", harness))?;
+
+        let pid = child.id();
+        Ok(pid)
+    } else {
+        // claude: use -p flag for prompt (claude writes directly to output_file)
+        let prompt_with_file = format!(
+            r#"{}
+
+CRITICAL: Write your final output to this exact file:
+{}
+
+Write to {} and exit when done."#,
+            prompt,
+            output_file.display(),
+            output_file.display()
+        );
+
+        cmd.arg("-p")
+            .arg(&prompt_with_file)
+            .arg("--dangerously-skip-permissions")
+            .stdin(Stdio::null());
+
+        let child = cmd.spawn()
+            .with_context(|| format!("failed to spawn {} session", harness))?;
+
+        let pid = child.id();
+        Ok(pid)
     }
-
-    cmd.stdin(Stdio::null());
-
-    let child = cmd.spawn()
-        .with_context(|| format!("failed to spawn {} session", harness))?;
-
-    let pid = child.id();
-    Ok(pid)
 }
 
 /// Task structure for the shared task list
