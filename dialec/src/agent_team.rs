@@ -153,8 +153,6 @@ Write to {} and exit when done."#,
 
         cmd.arg("exec")
             .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg("read-only")
             .arg("-m")
             .arg("gpt-5.5")
             .arg(&prompt_with_file)
