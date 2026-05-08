@@ -156,10 +156,14 @@ Write to {} and exit when done."#,
         cmd.arg("exec")
             .arg("--skip-git-repo-check")
             .arg("-m")
-            .arg("gpt-5.5")
-            .arg("--approval")
-            .arg(approval)
-            .arg(&prompt_with_file)
+            .arg("gpt-5.5");
+
+        // For codex, approval="never" means disable approvals and sandbox to allow autonomous file writes
+        if approval == "never" {
+            cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+        }
+
+        cmd.arg(&prompt_with_file)
             .stdin(Stdio::null());
 
         let child = cmd.spawn()
