@@ -430,6 +430,22 @@ fn cmd_harnesses(root: PathBuf, args: HarnessesArgs) -> Result<()> {
 
 fn cmd_start(root: PathBuf, args: StartArgs) -> Result<()> {
     ensure_layout(&root)?;
+
+    // Archive existing session if present
+    let dialec = dialec_dir(&root);
+    if dialec.exists() {
+        if let Ok(existing_state) = read_state(&root) {
+            let archive_dir = root.join(".dialec-sessions");
+            fs::create_dir_all(&archive_dir)?;
+            let archive_session = archive_dir.join(&existing_state.session_id);
+            if !archive_session.exists() {
+                fs::rename(&dialec, &archive_session)
+                    .with_context(|| format!("failed to archive session {} to {}", existing_state.session_id, archive_session.display()))?;
+                eprintln!("archived previous session {} to .dialec-sessions/{}", existing_state.session_id, existing_state.session_id);
+            }
+        }
+    }
+
     if !args.skip_check {
         let reports = probe_all(&root, true)?;
         let role_errors = validate_role_mappings(&root, &reports)?;
