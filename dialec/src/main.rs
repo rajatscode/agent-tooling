@@ -827,6 +827,12 @@ fn cmd_advance(root: PathBuf, args: DecisionArgs) -> Result<()> {
     let phase = args.phase.unwrap_or_else(|| state.current_phase.clone());
     let pod = args.pod.clone();
     let reason = args.reason.clone();
+
+    // Validate that phase is a known phase
+    if !matches!(phase.as_str(), "spec" | "implement" | "cleanup" | "done") {
+        anyhow::bail!("invalid phase '{}'; must be one of: spec, implement, cleanup, done", phase);
+    }
+
     let blockers = Ledger::read(&root)?.open_blocking(&phase, args.pod.as_deref());
     let accepted: Vec<_> = blockers.iter().map(|entry| entry.id.clone()).collect();
     for id in &accepted {
@@ -847,7 +853,8 @@ fn cmd_advance(root: PathBuf, args: DecisionArgs) -> Result<()> {
         "spec" => "implement".to_string(),
         "implement" => "cleanup".to_string(),
         "cleanup" => "done".to_string(),
-        other => other.to_string(),
+        "done" => "done".to_string(),
+        other => unreachable!("validated phase above: {}", other),
     };
     write_state(&root, &state)?;
     log_decision(
