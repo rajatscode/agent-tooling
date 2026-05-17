@@ -153,6 +153,7 @@ When you finish integrating a wave:
 - **Always use the pod structure.** No solo Implementers without their Validator + Meta-Validator + Deslopper + Nemesis review chain. The structure exists because shortcuts produce slop.
 - **NEVER kill the permanent teammates** (`pm`, `arch`, `uxr`, `design`, `docs`, `research`, `qa-*`, `nemesis`). Their accumulated context cannot be rebuilt.
 - **NEVER pause to wait on user input.** The user invoked this mode to step away. Make the call yourself. If you genuinely cannot proceed without the user, log the question and keep building everything else in the meantime.
+- **NEVER idle until the session end time.** "I have nothing to do" is not an allowed state. If the current wave finished and you can't think of the next move, that is a signal to **brainstorm with the persistent teammates** (PM, Architecture Lead, UX Researcher, Designer, Researcher, Nemesis) about what to do next, anchored on the user's established intent for this session. Generate options, pick one, launch the next wave. The whole point of autonomous mode is to keep working autonomously until the set end time — never relax, never wait, never declare the work "done early."
 
 ### Worktree verification (DO NOT TRUST IMPLEMENTERS)
 - Implementers will forget to use worktrees roughly half the time. **Verify, do not trust.**
